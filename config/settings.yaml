@@ -1,0 +1,40 @@
+aws:
+  region_name: ${AWS_DEFAULT_REGION:-ap-southeast-1}
+
+s3:
+  bucket_name: ${S3_BUCKET_NAME}
+  data_prefix: data
+  processed_folder: processed
+
+datasets:
+  puzzle-pieces-picker:
+    source:
+      type: url
+      path: https://figshare.com/ndownloader/files/44894080
+    unzip_password: null
+  m5hisdoc:
+    source:
+      type: file
+      path: /Users/erniesg/code/erniesg/if-letters-home-could-sing/data/M5HisDoc.zip
+    unzip_password: ${M5HISDOC_PASSWORD}
+  casia-hwdb:
+    source:
+      type: url
+      path:
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.0TrainPart1.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.0TrainPart2.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.0TrainPart3.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.1TrainPart1.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.1TrainPart2.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.1TrainPart3.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.2TrainPart1.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.2TrainPart2.zip
+        - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.2TrainPart3.zip
+    unzip_password: null
+
+processing:
+  num_workers: 4  # Default number of workers, can be overridden per dataset
+  batch_size: 1000  # Default batch size for processing, can be overridden per dataset
+
+dynamodb:
+  table_name: ETLJobTracker

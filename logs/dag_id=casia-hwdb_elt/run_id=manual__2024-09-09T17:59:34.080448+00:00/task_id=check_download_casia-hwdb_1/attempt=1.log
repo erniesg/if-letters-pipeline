@@ -1,0 +1,28 @@
+[2024-09-10T01:59:41.761+0800] {local_task_job_runner.py:123} INFO - ::group::Pre task execution logs
+[2024-09-10T01:59:41.765+0800] {taskinstance.py:2612} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: casia-hwdb_elt.check_download_casia-hwdb_1 manual__2024-09-09T17:59:34.080448+00:00 [queued]>
+[2024-09-10T01:59:41.767+0800] {taskinstance.py:2612} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: casia-hwdb_elt.check_download_casia-hwdb_1 manual__2024-09-09T17:59:34.080448+00:00 [queued]>
+[2024-09-10T01:59:41.767+0800] {taskinstance.py:2865} INFO - Starting attempt 1 of 4
+[2024-09-10T01:59:41.772+0800] {taskinstance.py:2888} INFO - Executing <Task(PythonOperator): check_download_casia-hwdb_1> on 2024-09-09 17:59:34.080448+00:00
+[2024-09-10T01:59:41.779+0800] {logging_mixin.py:190} WARNING - /Users/erniesg/.pyenv/versions/3.12.5/envs/letters_home/lib/python3.12/site-packages/airflow/task/task_runner/standard_task_runner.py:70 DeprecationWarning: This process (pid=67527) is multi-threaded, use of fork() may lead to deadlocks in the child.
+[2024-09-10T01:59:41.779+0800] {standard_task_runner.py:104} INFO - Running: ['airflow', 'tasks', 'run', 'casia-hwdb_elt', 'check_download_casia-hwdb_1', 'manual__2024-09-09T17:59:34.080448+00:00', '--job-id', '8', '--raw', '--subdir', 'DAGS_FOLDER/elt.py', '--cfg-path', '/var/folders/3n/sh024_795c590k086c59jsw00000gn/T/tmp13d5p03l']
+[2024-09-10T01:59:41.780+0800] {standard_task_runner.py:72} INFO - Started process 67528 to run task
+[2024-09-10T01:59:41.780+0800] {standard_task_runner.py:105} INFO - Job 8: Subtask check_download_casia-hwdb_1
+[2024-09-10T01:59:41.795+0800] {task_command.py:467} INFO - Running <TaskInstance: casia-hwdb_elt.check_download_casia-hwdb_1 manual__2024-09-09T17:59:34.080448+00:00 [running]> on host chens-macbook-pro.local
+[2024-09-10T01:59:41.817+0800] {taskinstance.py:3131} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='airflow' AIRFLOW_CTX_DAG_ID='casia-hwdb_elt' AIRFLOW_CTX_TASK_ID='check_download_casia-hwdb_1' AIRFLOW_CTX_EXECUTION_DATE='2024-09-09T17:59:34.080448+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='manual__2024-09-09T17:59:34.080448+00:00'
+[2024-09-10T01:59:41.818+0800] {logging_mixin.py:190} INFO - Task instance is in running state
+[2024-09-10T01:59:41.818+0800] {logging_mixin.py:190} INFO -  Previous state of the Task instance: queued
+[2024-09-10T01:59:41.818+0800] {logging_mixin.py:190} INFO - Current task name:check_download_casia-hwdb_1 state:running start_date:2024-09-09 17:59:41.765649+00:00
+[2024-09-10T01:59:41.818+0800] {logging_mixin.py:190} INFO - Dag name:casia-hwdb_elt and current dag run status:running
+[2024-09-10T01:59:41.818+0800] {taskinstance.py:731} INFO - ::endgroup::
+[2024-09-10T01:59:41.867+0800] {logging_mixin.py:190} INFO - Error getting job state: An error occurred (UnrecognizedClientException) when calling the GetItem operation: The security token included in the request is invalid.
+[2024-09-10T01:59:41.883+0800] {logging_mixin.py:190} INFO - Error creating job: An error occurred (UnrecognizedClientException) when calling the PutItem operation: The security token included in the request is invalid.
+[2024-09-10T01:59:41.883+0800] {python.py:240} INFO - Done. Returned value was: casia-hwdb_download_2024-09-09 17:59:34.080448+00:00
+[2024-09-10T01:59:41.888+0800] {taskinstance.py:340} INFO - ::group::Post task execution logs
+[2024-09-10T01:59:41.889+0800] {taskinstance.py:352} INFO - Marking task as SUCCESS. dag_id=casia-hwdb_elt, task_id=check_download_casia-hwdb_1, run_id=manual__2024-09-09T17:59:34.080448+00:00, execution_date=20240909T175934, start_date=20240909T175941, end_date=20240909T175941
+[2024-09-10T01:59:41.891+0800] {logging_mixin.py:190} INFO - Task instance in success state
+[2024-09-10T01:59:41.892+0800] {logging_mixin.py:190} INFO -  Previous state of the Task instance: running
+[2024-09-10T01:59:41.892+0800] {logging_mixin.py:190} INFO - Dag name:casia-hwdb_elt queued_at:2024-09-09 17:59:34.086593+00:00
+[2024-09-10T01:59:41.892+0800] {logging_mixin.py:190} INFO - Task hostname:chens-macbook-pro.local operator:PythonOperator
+[2024-09-10T01:59:41.928+0800] {local_task_job_runner.py:266} INFO - Task exited with return code 0
+[2024-09-10T01:59:41.941+0800] {taskinstance.py:3900} INFO - 1 downstream tasks scheduled from follow-on schedule check
+[2024-09-10T01:59:41.942+0800] {local_task_job_runner.py:245} INFO - ::endgroup::
