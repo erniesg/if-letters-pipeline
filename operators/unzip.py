@@ -1,15 +1,15 @@
+import io
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from airflow.models import BaseOperator
 from helpers.s3 import download_from_s3, check_s3_prefix_exists, list_s3_objects
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config, get_aws_credentials
-import zipfile
-import os
-import tempfile
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
 logger = logging.getLogger(__name__)
@@ -37,32 +37,53 @@ class UnzipOperator(BaseOperator):
         aws_credentials = get_aws_credentials()
         return boto3.client('s3', config=config, **aws_credentials)
 
-    def clean_s3_key(self, key):
-        return '/'.join(filter(None, key.split('/')))
-
-    def upload_to_s3_with_retry(self, s3_client, local_path, s3_key, max_retries=5):
+    def upload_to_s3_with_retry(self, s3_client, file_content, s3_key, max_retries=5):
         for attempt in range(max_retries):
             try:
-                clean_key = self.clean_s3_key(s3_key)
-                if os.path.isfile(local_path):
-                    s3_client.upload_file(local_path, self.s3_bucket, clean_key)
+                s3_client.put_object(Body=file_content, Bucket=self.s3_bucket, Key=s3_key)
                 return True
             except ClientError as e:
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)  # Exponential backoff
                 else:
-                    logger.error(f"Error uploading {clean_key}: {str(e)}")
-                    self.error_files.append({"file": clean_key, "error": str(e)})
+                    logger.error(f"Error uploading {s3_key}: {str(e)}")
+                    self.error_files.append({"file": s3_key, "error": str(e)})
                     return False
 
-    def process_batch(self, s3_client, file_batch):
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-            futures = []
-            for local_path, s3_key in file_batch:
-                futures.append(executor.submit(self.upload_to_s3_with_retry, s3_client, local_path, s3_key))
+    def process_zip_content(self, zip_content, job_id):
+        s3_client = self.get_s3_client()
+        total_size = len(zip_content)
+        processed_size = 0
+        processed_files = 0
 
-            for future in as_completed(futures):
-                future.result()  # This will raise any exceptions that occurred during execution
+        with io.BytesIO(zip_content) as zip_buffer, zipfile.ZipFile(zip_buffer) as zip_ref:
+            total_files = len(zip_ref.namelist())
+            logger.info(f"Total files in zip: {total_files}")
+
+            with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
+                futures = []
+                for file_info in zip_ref.infolist():
+                    if file_info.filename.endswith('/'):  # Skip directories
+                        continue
+
+                    with zip_ref.open(file_info.filename, pwd=self.unzip_password.encode() if self.unzip_password else None) as file:
+                        file_content = file.read()
+                        s3_key = f"{self.destination_prefix}/{file_info.filename}"
+                        futures.append(executor.submit(self.upload_to_s3_with_retry, s3_client, file_content, s3_key))
+
+                    processed_size += file_info.file_size
+                    processed_files += 1
+                    if processed_files % 100 == 0 or processed_files == total_files:
+                        progress = int((processed_size / total_size) * 100)
+                        logger.info(f"Unzip progress: {progress}% ({processed_files}/{total_files} files)")
+                        update_job_state(job_id, status='in_progress', progress=progress,
+                                         metadata={'processed_files': processed_files, 'total_files': total_files,
+                                                   'processed_size': processed_size, 'total_size': total_size})
+
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Uploading files"):
+                    future.result()
+
+        return processed_files, total_files
 
     def execute(self, context):
         job_id = f"{self.dataset_name}_unzip_{context['execution_date']}"
@@ -75,54 +96,15 @@ class UnzipOperator(BaseOperator):
                 return
 
             update_job_state(job_id, status='in_progress', progress=0)
-            logger.info("Progress: 0%")
+            logger.info("Starting unzip operation")
 
             logger.info("Downloading zip file...")
             zip_content = download_from_s3(self.s3_bucket, self.s3_key)
             if not zip_content:
                 raise ValueError(f"Failed to download zip file from s3://{self.s3_bucket}/{self.s3_key}")
 
-            s3_client = self.get_s3_client()
-            total_files = 0
-            processed_files = 0
-
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_zip_path = os.path.join(temp_dir, "temp.zip")
-                with open(temp_zip_path, 'wb') as temp_file:
-                    temp_file.write(zip_content)
-
-                logger.info("Unzipping and uploading files in batches...")
-                with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(path=temp_dir, pwd=self.unzip_password.encode() if self.unzip_password else None)
-
-                    file_batch = []
-                    total_files = sum([len(files) for _, _, files in os.walk(temp_dir)]) - 1  # Subtract 1 for the zip file itself
-                    logger.info(f"Total files to process: {total_files}")
-
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            if file == "temp.zip":
-                                continue
-                            local_path = os.path.join(root, file)
-                            relative_path = os.path.relpath(local_path, temp_dir)
-                            s3_key = f"{self.destination_prefix}/{relative_path}"
-                            file_batch.append((local_path, s3_key))
-
-                            if len(file_batch) >= self.batch_size:
-                                self.process_batch(s3_client, file_batch)
-                                processed_files += len(file_batch)
-                                file_batch = []
-
-                                progress = int((processed_files / total_files) * 100)
-                                if progress in [0, 20, 40, 60, 80, 100]:
-                                    logger.info(f"Progress: {progress}%")
-                                    update_job_state(job_id, status='in_progress', progress=progress,
-                                                     metadata={'processed_files': processed_files})
-
-                    # Process any remaining files
-                    if file_batch:
-                        self.process_batch(s3_client, file_batch)
-                        processed_files += len(file_batch)
+            logger.info("Processing zip content...")
+            processed_files, total_files = self.process_zip_content(zip_content, job_id)
 
             if self.error_files:
                 logger.warning(f"Encountered errors with {len(self.error_files)} files.")
@@ -130,11 +112,13 @@ class UnzipOperator(BaseOperator):
                     logger.error(f"Error in file {error['file']}: {error['error']}")
 
                 update_job_state(job_id, status='completed_with_errors', progress=100,
-                                 metadata={'error_files': len(self.error_files), 'first_10_errors': self.error_files[:10]})
+                                 metadata={'processed_files': processed_files, 'total_files': total_files,
+                                           'error_files': len(self.error_files), 'first_10_errors': self.error_files[:10]})
             else:
-                update_job_state(job_id, status='completed', progress=100)
+                update_job_state(job_id, status='completed', progress=100,
+                                 metadata={'processed_files': processed_files, 'total_files': total_files})
 
-            logger.info(f"Unzip operation completed. Processed {processed_files} files, with {len(self.error_files)} errors.")
+            logger.info(f"Unzip operation completed. Processed {processed_files}/{total_files} files.")
             logger.info(f"Files uploaded to s3://{self.s3_bucket}/{self.destination_prefix}/")
         except Exception as e:
             logger.error(f"Unzip operation failed: {str(e)}")
