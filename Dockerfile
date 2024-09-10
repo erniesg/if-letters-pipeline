@@ -4,9 +4,17 @@ FROM quay.io/astronomer/astro-runtime:${ASTRO_RUNTIME_VERSION}
 # Switch to root temporarily for setup
 USER root
 
-# Create a new user 'airflow' with a specific UID/GID
-RUN groupadd -g 50000 airflow && \
-    useradd -u 50000 -g airflow -m -s /bin/bash airflow
+# Create a script to add the airflow user with the next available UID/GID
+RUN echo '#!/bin/bash\n\
+NEXT_UID=$(cat /etc/passwd | awk -F: "{if (\$3>LAST_UID) LAST_UID=\$3} END {print LAST_UID+1}")\n\
+NEXT_GID=$(cat /etc/group | awk -F: "{if (\$3>LAST_GID) LAST_GID=\$3} END {print LAST_GID+1}")\n\
+groupadd -g $NEXT_GID airflow\n\
+useradd -u $NEXT_UID -g airflow -m -s /bin/bash airflow\n\
+echo "Created airflow user with UID: $NEXT_UID and GID: $NEXT_GID"' > /usr/local/bin/create_airflow_user.sh && \
+    chmod +x /usr/local/bin/create_airflow_user.sh
+
+# Run the script to create the airflow user
+RUN /usr/local/bin/create_airflow_user.sh
 
 # Copy the entire project into the airflow directory
 COPY --chown=airflow:airflow . /usr/local/airflow
