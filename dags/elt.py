@@ -17,7 +17,7 @@ def create_dataset_dag(dataset_name, default_args):
         default_args=default_args,
         schedule_interval=None,
         catchup=False,
-       dagrun_timeout=timedelta(minutes=60)  # Adjust this value as needed
+        dagrun_timeout=timedelta(minutes=60)  # Adjust this value as needed
     ) as dag:
         config = get_config()
         dataset_config = config['datasets'][dataset_name]
@@ -129,8 +129,7 @@ def create_dataset_dag(dataset_name, default_args):
                 dataset_name=dataset_name,
                 s3_key=s3_key,
                 max_pool_connections=max_pool_connections,
-                max_concurrency=max_concurrency,
-                batch_size=batch_size
+                max_concurrency=max_concurrency
             )
             result = unzip_op.execute(context)
             logger.info(f"Unzip result: {result}")
