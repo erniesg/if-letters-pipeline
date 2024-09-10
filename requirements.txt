@@ -5,3 +5,4 @@ moto==5.0.13
 apache-airflow-providers-amazon
 apache-airflow-providers-cncf-kubernetes
 python-dotenv==1.0.1
+tqdm==4.66.5

@@ -1,5 +1,5 @@
 aws:
-  region_name: ${AWS_DEFAULT_REGION:-ap-southeast-1}
+  region_name: ${AWS_DEFAULT_REGION:ap-southeast-1}
 
 s3:
   bucket_name: ${S3_BUCKET_NAME}

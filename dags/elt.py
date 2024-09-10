@@ -6,7 +6,7 @@ from operators.download import DownloadOperator
 from operators.unzip import UnzipOperator
 from helpers.dynamodb import create_job, update_job_state, get_job_state
 from helpers.s3 import check_s3_object_exists, get_s3_object_info
-from helpers.config import get_config  # Update this import
+from helpers.config import get_config
 import logging
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ def create_dataset_dag(dataset_name, default_args):
         schedule_interval=None,
         catchup=False
     ) as dag:
-        config = get_config()  # Get the configuration
+        config = get_config()
         dataset_config = config['datasets'][dataset_name]
         s3_config = config['s3']
 
@@ -28,8 +28,9 @@ def create_dataset_dag(dataset_name, default_args):
 
         start = DummyOperator(task_id='start')
 
-        def check_and_create_job(task_id, dataset_name, operation, file_index=None, **kwargs):
-            job_id = f"{dataset_name}_{operation}_{kwargs['execution_date']}"
+        def check_and_create_job(task_id, dataset_name, operation, file_index=None, **context):
+            execution_date = context['execution_date']
+            job_id = f"{dataset_name}_{operation}_{execution_date}"
             if file_index is not None:
                 job_id += f"_{file_index}"
             logger.info(f"Checking job state for: {job_id}")
@@ -41,7 +42,7 @@ def create_dataset_dag(dataset_name, default_args):
             create_job(job_id, dataset_name, operation)
             return job_id
 
-        def process_download(source, s3_bucket, s3_key, dataset_name, job_id, **kwargs):
+        def process_download(source, s3_bucket, s3_key, dataset_name, job_id, **context):
             logger.info(f"Processing download for {dataset_name}")
             logger.info(f"S3 bucket: {s3_bucket}, S3 key: {s3_key}")
             if check_s3_object_exists(s3_bucket, s3_key):
@@ -58,41 +59,76 @@ def create_dataset_dag(dataset_name, default_args):
                 s3_bucket=s3_bucket,
                 s3_key=s3_key
             )
-            result = download_op.execute(kwargs)
+            result = download_op.execute(context)
             logger.info(f"Download result: {result}")
             update_job_state(job_id, status="completed", progress=100, metadata=result)
             return result
 
-        def process_unzip(s3_bucket, s3_key, destination_prefix, dataset_name, unzip_password, job_id, **kwargs):
+        def process_unzip(dataset_name, **context):
+            if isinstance(dataset_config['source']['path'], list):
+                unzip_tasks = []
+                for i, path in enumerate(dataset_config['source']['path']):
+                    s3_key = f"{s3_config['data_prefix']}/{dataset_name}_{i}.zip"
+                    unzip_task = PythonOperator(
+                        task_id=f'unzip_{dataset_name}_{i}',
+                        python_callable=execute_unzip,
+                        op_kwargs={
+                            's3_key': s3_key,
+                            'dataset_name': dataset_name,
+                            'file_index': i,
+                            'max_pool_connections': 50,
+                            'max_concurrency': 16,
+                            'batch_size': 5000
+                        },
+                        provide_context=True
+                    )
+                    unzip_tasks.append(unzip_task)
+                return unzip_tasks
+            else:
+                s3_key = f"{s3_config['data_prefix']}/{dataset_name}.zip"
+                return PythonOperator(
+                    task_id=f'unzip_{dataset_name}',
+                    python_callable=execute_unzip,
+                    op_kwargs={
+                        's3_key': s3_key,
+                        'dataset_name': dataset_name,
+                        'max_pool_connections': 50,
+                        'max_concurrency': 16,
+                        'batch_size': 5000
+                    },
+                    provide_context=True
+                )
+
+        def execute_unzip(s3_key, dataset_name, max_pool_connections, max_concurrency, batch_size, file_index=None, **context):
+            execution_date = context['execution_date']
+            job_id = f"{dataset_name}_unzip_{execution_date}"
+            if file_index is not None:
+                job_id += f"_{file_index}"
+
             logger.info(f"Processing unzip for {dataset_name}")
-            logger.info(f"S3 bucket: {s3_bucket}, S3 key: {s3_key}, Destination: {destination_prefix}")
-            logger.info(f"Unzip password: {unzip_password}")  # Add this line for debugging
-            if check_s3_object_exists(s3_bucket, destination_prefix):
-                logger.info(f"Destination already exists: {destination_prefix}")
-                update_job_state(job_id, status="completed", progress=100)
-                return 'skip'
+            logger.info(f"S3 key: {s3_key}")
 
             unzip_op = UnzipOperator(
                 task_id=f'unzip_{dataset_name}',
                 dataset_name=dataset_name,
-                s3_bucket=s3_bucket,
                 s3_key=s3_key,
-                destination_prefix=destination_prefix,
-                unzip_password=unzip_password
+                max_pool_connections=max_pool_connections,
+                max_concurrency=max_concurrency,
+                batch_size=batch_size
             )
-            result = unzip_op.execute(kwargs)
+            result = unzip_op.execute(context)
             logger.info(f"Unzip result: {result}")
             update_job_state(job_id, status="completed", progress=100, metadata=result)
             return result
 
         if isinstance(dataset_config['source']['path'], list):
             download_tasks = []
-            unzip_tasks = []
             for i, path in enumerate(dataset_config['source']['path']):
                 check_download = PythonOperator(
                     task_id=f'check_download_{dataset_name}_{i}',
                     python_callable=check_and_create_job,
-                    op_kwargs={'task_id': f'download_{dataset_name}_{i}', 'dataset_name': dataset_name, 'operation': 'download', 'file_index': i}
+                    op_kwargs={'task_id': f'download_{dataset_name}_{i}', 'dataset_name': dataset_name, 'operation': 'download', 'file_index': i},
+                    provide_context=True
                 )
 
                 download_task = PythonOperator(
@@ -104,36 +140,30 @@ def create_dataset_dag(dataset_name, default_args):
                         's3_key': f"{s3_config['data_prefix']}/{dataset_name}_{i}.zip",
                         'dataset_name': dataset_name,
                         'job_id': f"{dataset_name}_download_{i}_{{{{ execution_date }}}}"
-                    }
+                    },
+                    provide_context=True
                 )
 
-                check_unzip = PythonOperator(
-                    task_id=f'check_unzip_{dataset_name}_{i}',
-                    python_callable=check_and_create_job,
-                    op_kwargs={'task_id': f'unzip_{dataset_name}_{i}', 'dataset_name': dataset_name, 'operation': 'unzip', 'file_index': i}
-                )
-
-                unzip_task = PythonOperator(
-                    task_id=f'unzip_{dataset_name}_{i}',
-                    python_callable=process_unzip,
-                    op_kwargs={
-                        's3_bucket': s3_config['bucket_name'],
-                        's3_key': f"{s3_config['data_prefix']}/{dataset_name}_{i}.zip",
-                        'destination_prefix': f"{s3_config['processed_folder']}/{dataset_name}",
-                        'dataset_name': dataset_name,
-                        'unzip_password': dataset_config.get('unzip_password'),
-                        'job_id': f"{dataset_name}_unzip_{i}_{{{{ execution_date }}}}"
-                    }
-                )
-
-                start >> check_download >> download_task >> check_unzip >> unzip_task
+                start >> check_download >> download_task
                 download_tasks.append(download_task)
-                unzip_tasks.append(unzip_task)
+
+            check_unzip = PythonOperator(
+                task_id=f'check_unzip_{dataset_name}',
+                python_callable=check_and_create_job,
+                op_kwargs={'task_id': f'unzip_{dataset_name}', 'dataset_name': dataset_name, 'operation': 'unzip'},
+                provide_context=True
+            )
+
+            unzip_tasks = process_unzip(dataset_name)
+            for download_task, unzip_task in zip(download_tasks, unzip_tasks):
+                download_task >> check_unzip >> unzip_task
+
         else:
             check_download = PythonOperator(
                 task_id=f'check_download_{dataset_name}',
                 python_callable=check_and_create_job,
-                op_kwargs={'task_id': f'download_{dataset_name}', 'dataset_name': dataset_name, 'operation': 'download'}
+                op_kwargs={'task_id': f'download_{dataset_name}', 'dataset_name': dataset_name, 'operation': 'download'},
+                provide_context=True
             )
 
             download_task = PythonOperator(
@@ -145,27 +175,18 @@ def create_dataset_dag(dataset_name, default_args):
                     's3_key': f"{s3_config['data_prefix']}/{dataset_name}.zip",
                     'dataset_name': dataset_name,
                     'job_id': f"{dataset_name}_download_{{{{ execution_date }}}}"
-                }
+                },
+                provide_context=True
             )
 
             check_unzip = PythonOperator(
                 task_id=f'check_unzip_{dataset_name}',
                 python_callable=check_and_create_job,
-                op_kwargs={'task_id': f'unzip_{dataset_name}', 'dataset_name': dataset_name, 'operation': 'unzip'}
+                op_kwargs={'task_id': f'unzip_{dataset_name}', 'dataset_name': dataset_name, 'operation': 'unzip'},
+                provide_context=True
             )
 
-            unzip_task = PythonOperator(
-                task_id=f'unzip_{dataset_name}',
-                python_callable=process_unzip,
-                op_kwargs={
-                    's3_bucket': s3_config['bucket_name'],
-                    's3_key': f"{s3_config['data_prefix']}/{dataset_name}.zip",
-                    'destination_prefix': f"{s3_config['processed_folder']}/{dataset_name}",
-                    'dataset_name': dataset_name,
-                    'unzip_password': dataset_config.get('unzip_password'),
-                    'job_id': f"{dataset_name}_unzip_{{{{ execution_date }}}}"
-                }
-            )
+            unzip_task = process_unzip(dataset_name)
 
             start >> check_download >> download_task >> check_unzip >> unzip_task
 
@@ -180,7 +201,7 @@ def create_dataset_dag(dataset_name, default_args):
     return dag
 
 # Create a DAG for each dataset
-config = get_config()  # Get the configuration once
+config = get_config()
 for dataset in config['datasets']:
     dag_id = f"{dataset}_elt_dag"
     logger.info(f"Creating DAG: {dag_id}")
