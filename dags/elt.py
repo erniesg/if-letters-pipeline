@@ -21,10 +21,12 @@ def create_dataset_dag(dataset_name, default_args):
         config = get_config()
         dataset_config = config['datasets'][dataset_name]
         s3_config = config['s3']
+        processing_config = config['processing']  # Added this line
 
         logger.info(f"Creating DAG for dataset: {dataset_name}")
         logger.info(f"S3 config: {s3_config}")
         logger.info(f"Dataset config: {dataset_config}")
+        logger.info(f"Processing config: {processing_config}")  # Added this line
 
         start = DummyOperator(task_id='start')
 
@@ -65,6 +67,12 @@ def create_dataset_dag(dataset_name, default_args):
             return result
 
         def process_unzip(dataset_name, **context):
+            # Use processing config, fall back to dataset config if specified
+            batch_size = dataset_config.get('batch_size', processing_config['batch_size'])
+            num_workers = dataset_config.get('num_workers', processing_config['num_workers'])
+            max_pool_connections = num_workers * 2  # Adjust this multiplier as needed
+            max_concurrency = num_workers
+
             if isinstance(dataset_config['source']['path'], list):
                 unzip_tasks = []
                 for i, path in enumerate(dataset_config['source']['path']):
@@ -76,9 +84,9 @@ def create_dataset_dag(dataset_name, default_args):
                             's3_key': s3_key,
                             'dataset_name': dataset_name,
                             'file_index': i,
-                            'max_pool_connections': 50,
-                            'max_concurrency': 16,
-                            'batch_size': 5000
+                            'max_pool_connections': max_pool_connections,
+                            'max_concurrency': max_concurrency,
+                            'batch_size': batch_size
                         },
                         provide_context=True
                     )
@@ -92,9 +100,9 @@ def create_dataset_dag(dataset_name, default_args):
                     op_kwargs={
                         's3_key': s3_key,
                         'dataset_name': dataset_name,
-                        'max_pool_connections': 50,
-                        'max_concurrency': 16,
-                        'batch_size': 5000
+                        'max_pool_connections': max_pool_connections,
+                        'max_concurrency': max_concurrency,
+                        'batch_size': batch_size
                     },
                     provide_context=True
                 )
