@@ -3,7 +3,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from airflow.models import BaseOperator
-from helpers.s3 import download_from_s3, check_s3_prefix_exists, list_s3_objects
+from helpers.s3 import upload_to_s3, check_s3_prefix_exists, list_s3_objects
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config, get_aws_credentials
 import boto3
@@ -15,7 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class UnzipOperator(BaseOperator):
-    def __init__(self, dataset_name, s3_key, max_pool_connections=50, max_concurrency=16, batch_size=5000, **kwargs):
+    def __init__(self, dataset_name, s3_key, max_pool_connections=50, max_concurrency=16, **kwargs):
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
         self.s3_key = s3_key
@@ -24,7 +24,11 @@ class UnzipOperator(BaseOperator):
         self.s3_bucket = self.s3_config['bucket_name']
         self.destination_prefix = f"{self.s3_config['processed_folder']}/{self.dataset_name}"
         self.unzip_password = self.config['datasets'][dataset_name].get('unzip_password')
-        self.batch_size = batch_size
+
+        # Get batch size from config, with dataset-specific override if available
+        self.batch_size = self.config['datasets'][dataset_name].get('batch_size',
+                                                                    self.config['processing']['batch_size'])
+
         self.error_files = []
         self.max_pool_connections = max_pool_connections
         self.max_concurrency = max_concurrency
@@ -37,24 +41,28 @@ class UnzipOperator(BaseOperator):
         aws_credentials = get_aws_credentials()
         return boto3.client('s3', config=config, **aws_credentials)
 
-    def upload_to_s3_with_retry(self, s3_client, file_content, s3_key, max_retries=5):
-        for attempt in range(max_retries):
+    def upload_batch_to_s3(self, s3_client, batch, batch_number):
+        batch_key = f"{self.destination_prefix}/batch_{batch_number}.zip"
+        with io.BytesIO() as batch_buffer:
+            with zipfile.ZipFile(batch_buffer, 'w', zipfile.ZIP_DEFLATED) as batch_zip:
+                for filename, content in batch:
+                    batch_zip.writestr(filename, content)
+            batch_buffer.seek(0)
             try:
-                s3_client.put_object(Body=file_content, Bucket=self.s3_bucket, Key=s3_key)
+                s3_client.upload_fileobj(batch_buffer, self.s3_bucket, batch_key)
                 return True
             except ClientError as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    logger.error(f"Error uploading {s3_key}: {str(e)}")
-                    self.error_files.append({"file": s3_key, "error": str(e)})
-                    return False
+                logger.error(f"Error uploading batch {batch_number}: {str(e)}")
+                self.error_files.extend([{"file": filename, "error": str(e)} for filename, _ in batch])
+                return False
 
     def process_zip_content(self, zip_content, job_id):
         s3_client = self.get_s3_client()
         total_size = len(zip_content)
         processed_size = 0
         processed_files = 0
+        batch_number = 0
+        current_batch = []
 
         with io.BytesIO(zip_content) as zip_buffer, zipfile.ZipFile(zip_buffer) as zip_ref:
             total_files = len(zip_ref.namelist())
@@ -62,25 +70,30 @@ class UnzipOperator(BaseOperator):
 
             with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
                 futures = []
-                for file_info in zip_ref.infolist():
+                for file_info in tqdm(zip_ref.infolist(), total=total_files, desc="Processing files"):
                     if file_info.filename.endswith('/'):  # Skip directories
                         continue
 
                     with zip_ref.open(file_info.filename, pwd=self.unzip_password.encode() if self.unzip_password else None) as file:
                         file_content = file.read()
-                        s3_key = f"{self.destination_prefix}/{file_info.filename}"
-                        futures.append(executor.submit(self.upload_to_s3_with_retry, s3_client, file_content, s3_key))
+                        current_batch.append((file_info.filename, file_content))
 
                     processed_size += file_info.file_size
                     processed_files += 1
-                    if processed_files % 100 == 0 or processed_files == total_files:
+
+                    if len(current_batch) >= self.batch_size or processed_files == total_files:
+                        futures.append(executor.submit(self.upload_batch_to_s3, s3_client, current_batch, batch_number))
+                        batch_number += 1
+                        current_batch = []
+
+                    if processed_files % 1000 == 0 or processed_files == total_files:
                         progress = int((processed_size / total_size) * 100)
                         logger.info(f"Unzip progress: {progress}% ({processed_files}/{total_files} files)")
                         update_job_state(job_id, status='in_progress', progress=progress,
                                          metadata={'processed_files': processed_files, 'total_files': total_files,
                                                    'processed_size': processed_size, 'total_size': total_size})
 
-                for future in tqdm(as_completed(futures), total=len(futures), desc="Uploading files"):
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Uploading batches"):
                     future.result()
 
         return processed_files, total_files
@@ -99,7 +112,7 @@ class UnzipOperator(BaseOperator):
             logger.info("Starting unzip operation")
 
             logger.info("Downloading zip file...")
-            zip_content = download_from_s3(self.s3_bucket, self.s3_key)
+            zip_content = self.download_from_s3(self.s3_bucket, self.s3_key)
             if not zip_content:
                 raise ValueError(f"Failed to download zip file from s3://{self.s3_bucket}/{self.s3_key}")
 
@@ -124,3 +137,12 @@ class UnzipOperator(BaseOperator):
             logger.error(f"Unzip operation failed: {str(e)}")
             update_job_state(job_id, status='failed', progress=0, metadata={'error': str(e)})
             raise
+
+    def download_from_s3(self, bucket, key):
+        s3_client = self.get_s3_client()
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            return response['Body'].read()
+        except ClientError as e:
+            logger.error(f"Error downloading {key} from S3: {str(e)}")
+            return None

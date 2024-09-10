@@ -1,16 +1,23 @@
 FROM quay.io/astronomer/astro-runtime:12.1.0
 
+# Set custom AIRFLOW_HOME
+ENV AIRFLOW_HOME=/opt/airflow
+
 # Switch to root temporarily for setup
 USER root
 
-# Copy the entire project into the airflow directory
+# Create the custom AIRFLOW_HOME directory and set permissions
+RUN mkdir -p ${AIRFLOW_HOME} && \
+    chown -R astro:astro ${AIRFLOW_HOME}
+
+# Copy the entire project into the new airflow directory
 COPY . ${AIRFLOW_HOME}
 
 # Install any needed packages specified in requirements.txt
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Set PYTHONPATH if needed
+# Set PYTHONPATH to include the new AIRFLOW_HOME
 ENV PYTHONPATH="${PYTHONPATH}:${AIRFLOW_HOME}"
 
 # Switch back to the astro user
