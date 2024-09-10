@@ -31,6 +31,7 @@ datasets:
         - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.2TrainPart2.zip
         - https://nlpr.ia.ac.cn/databases/Download/Offline/CharData/Gnt1.2TrainPart3.zip
     unzip_password: null
+    batch_size: 100
 
 processing:
   num_workers: 4  # Default number of workers, can be overridden per dataset
