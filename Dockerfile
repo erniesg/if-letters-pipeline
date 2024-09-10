@@ -5,7 +5,7 @@ FROM quay.io/astronomer/astro-runtime:${ASTRO_RUNTIME_VERSION}
 COPY . /usr/local/airflow
 
 # Set PYTHONPATH to include both /usr/local/airflow and the pipeline directory
-ENV PYTHONPATH="/usr/local/airflow:/usr/local/airflow/dags:/usr/local/airflow/helpers:/usr/local/airflow/operators:${PYTHONPATH}"
+ENV PYTHONPATH="/usr/local/airflow:/usr/local/airflow/dags:/usr/local/airflow/helpers:/usr/local/airflow/operators:/usr/local/airflow/include:${PYTHONPATH}"
 
 # Install any needed packages specified in requirements.txt
 COPY requirements.txt /tmp/requirements.txt
@@ -23,4 +23,4 @@ RUN echo "PYTHONPATH: $PYTHONPATH"
 RUN echo "Contents of /usr/local/airflow:" && ls -R /usr/local/airflow
 RUN echo "Contents of /usr/local/airflow/dags:" && ls -R /usr/local/airflow/dags
 RUN echo "Contents of /usr/local/airflow/helpers:" && ls -R /usr/local/airflow/helpers
-RUN echo "Contents of /usr/local/airflow/include:" && ls -R /usr/local/airflow/include
+RUN echo "Contents of /usr/local/airflow/include:" && ls -la /usr/local/airflow/include || echo "Include directory is empty or does not exist"
