@@ -16,7 +16,8 @@ def create_dataset_dag(dataset_name, default_args):
         dag_id=f'{dataset_name}_elt',
         default_args=default_args,
         schedule_interval=None,
-        catchup=False
+        catchup=False,
+       dagrun_timeout=timedelta(minutes=60)  # Adjust this value as needed
     ) as dag:
         config = get_config()
         dataset_config = config['datasets'][dataset_name]

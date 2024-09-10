@@ -11,6 +11,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import time
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class UnzipOperator(BaseOperator):
             logger.info(f"Files uploaded to s3://{self.s3_bucket}/{self.destination_prefix}/")
         except Exception as e:
             logger.error(f"Unzip operation failed: {str(e)}")
+            self.log.error(traceback.format_exc())
             update_job_state(job_id, status='failed', progress=0, metadata={'error': str(e)})
             raise
 
