@@ -15,7 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class UnzipOperator(BaseOperator):
-    def __init__(self, dataset_name, s3_key, max_pool_connections=50, max_concurrency=16, **kwargs):
+    def __init__(self, dataset_name, s3_key, max_pool_connections=50, max_concurrency=16, batch_size=None, **kwargs):
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
         self.s3_key = s3_key
@@ -25,8 +25,8 @@ class UnzipOperator(BaseOperator):
         self.destination_prefix = f"{self.s3_config['processed_folder']}/{self.dataset_name}"
         self.unzip_password = self.config['datasets'][dataset_name].get('unzip_password')
 
-        # Get batch size from config, with dataset-specific override if available
-        self.batch_size = self.config['datasets'][dataset_name].get('batch_size',
+        # Use the provided batch_size if available, otherwise use the default from config
+        self.batch_size = batch_size or self.config['datasets'][dataset_name].get('batch_size',
                                                                     self.config['processing']['batch_size'])
 
         self.error_files = []
