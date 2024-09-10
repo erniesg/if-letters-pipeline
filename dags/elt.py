@@ -50,7 +50,8 @@ def create_dataset_dag(dataset_name, default_args):
 
             if source['type'] == 's3':
                 # For S3 sources, we skip the download step
-                logger.info(f"S3 source detected. Skipping download for {s3_key}")
+                s3_key = source['path']
+                logger.info(f"S3 source detected. Using configured path: {s3_key}")
                 update_job_state(job_id, status="completed", progress=100)
                 return 'skip'
 
@@ -99,7 +100,7 @@ def create_dataset_dag(dataset_name, default_args):
                     unzip_tasks.append(unzip_task)
                 return unzip_tasks
             else:
-                s3_key = f"{s3_config['data_prefix']}/{dataset_name}.zip"
+                s3_key = dataset_config['source']['path'] if dataset_config['source']['type'] == 's3' else f"{s3_config['data_prefix']}/{dataset_name}.zip"
                 return PythonOperator(
                     task_id=f'unzip_{dataset_name}',
                     python_callable=execute_unzip,
