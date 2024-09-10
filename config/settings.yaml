@@ -14,8 +14,8 @@ datasets:
     unzip_password: null
   m5hisdoc:
     source:
-      type: file
-      path: /Users/erniesg/code/erniesg/if-letters-home-could-sing/data/M5HisDoc.zip
+      type: s3
+      path: data/M5HisDoc.zip
     unzip_password: ${M5HISDOC_PASSWORD}
   casia-hwdb:
     source:

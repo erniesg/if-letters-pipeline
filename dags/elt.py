@@ -21,12 +21,12 @@ def create_dataset_dag(dataset_name, default_args):
         config = get_config()
         dataset_config = config['datasets'][dataset_name]
         s3_config = config['s3']
-        processing_config = config['processing']  # Added this line
+        processing_config = config['processing']
 
         logger.info(f"Creating DAG for dataset: {dataset_name}")
         logger.info(f"S3 config: {s3_config}")
         logger.info(f"Dataset config: {dataset_config}")
-        logger.info(f"Processing config: {processing_config}")  # Added this line
+        logger.info(f"Processing config: {processing_config}")
 
         start = DummyOperator(task_id='start')
 
@@ -47,6 +47,13 @@ def create_dataset_dag(dataset_name, default_args):
         def process_download(source, s3_bucket, s3_key, dataset_name, job_id, **context):
             logger.info(f"Processing download for {dataset_name}")
             logger.info(f"S3 bucket: {s3_bucket}, S3 key: {s3_key}")
+
+            if source['type'] == 's3':
+                # For S3 sources, we skip the download step
+                logger.info(f"S3 source detected. Skipping download for {s3_key}")
+                update_job_state(job_id, status="completed", progress=100)
+                return 'skip'
+
             if check_s3_object_exists(s3_bucket, s3_key):
                 file_info = get_s3_object_info(s3_bucket, s3_key)
                 logger.info(f"File already exists: {s3_key}")
@@ -67,10 +74,9 @@ def create_dataset_dag(dataset_name, default_args):
             return result
 
         def process_unzip(dataset_name, **context):
-            # Use processing config, fall back to dataset config if specified
             batch_size = dataset_config.get('batch_size', processing_config['batch_size'])
             num_workers = dataset_config.get('num_workers', processing_config['num_workers'])
-            max_pool_connections = num_workers * 2  # Adjust this multiplier as needed
+            max_pool_connections = num_workers * 2
             max_concurrency = num_workers
 
             if isinstance(dataset_config['source']['path'], list):

@@ -1,5 +1,5 @@
 from airflow.models import BaseOperator
-from helpers.s3 import upload_to_s3, get_s3_object_info, check_s3_object_exists
+from helpers.s3 import upload_to_s3, get_s3_object_info, check_s3_object_exists, copy_s3_object
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config
 import requests
@@ -20,22 +20,19 @@ class DownloadOperator(BaseOperator):
         try:
             update_job_state(job_id, status='in_progress', progress=0)
 
-            # Check if file already exists in S3
-            if check_s3_object_exists(self.s3_bucket, self.s3_key):
+            if check_s3_object_exists(self.s3_bucket, self.s3_key) and not self.overwrite:
                 file_info = get_s3_object_info(self.s3_bucket, self.s3_key)
                 self.log.info(f"File already exists: {self.s3_key}")
                 self.log.info(f"Size: {file_info['ContentLength']}, Type: {file_info['ContentType']}")
-
-                if not self.overwrite:
-                    update_job_state(job_id, status='completed', progress=100, metadata=file_info)
-                    return file_info
-                else:
-                    self.log.info("Overwrite flag is set. Proceeding with download.")
+                update_job_state(job_id, status='completed', progress=100, metadata=file_info)
+                return file_info
 
             if self.source['type'] == 'url':
                 self.download_from_url()
             elif self.source['type'] == 'file':
                 self.upload_from_local()
+            elif self.source['type'] == 's3':
+                self.copy_from_s3()
             else:
                 raise ValueError(f"Unsupported source type: {self.source['type']}")
 
@@ -62,3 +59,8 @@ class DownloadOperator(BaseOperator):
             raise FileNotFoundError(f"Local file not found: {local_file_path}")
         with open(local_file_path, 'rb') as file:
             upload_to_s3(file.read(), self.s3_bucket, self.s3_key)
+
+    def copy_from_s3(self):
+        source_bucket, source_key = self.source['path'].split('/', 1)
+        self.log.info(f"Copying from S3: s3://{source_bucket}/{source_key} to s3://{self.s3_bucket}/{self.s3_key}")
+        copy_s3_object(source_bucket, source_key, self.s3_bucket, self.s3_key)

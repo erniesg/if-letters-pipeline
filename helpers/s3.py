@@ -19,6 +19,7 @@ def upload_to_s3(content, bucket, s3_key):
         logger.info(f"Successfully uploaded to s3://{bucket}/{s3_key}")
     except ClientError as e:
         logger.error(f"Error uploading to s3://{bucket}/{s3_key}: {str(e)}")
+        raise
 
 @ensure_resource('s3')
 @handle_existing_item
@@ -82,5 +83,21 @@ def list_s3_objects(bucket, prefix):
         logger.error(f"Error listing objects in s3://{bucket}/{prefix}: {str(e)}")
         return []
 
+@ensure_resource('s3')
+@handle_existing_item
+def copy_s3_object(source_bucket, source_key, dest_bucket, dest_key):
+    s3_client = get_s3_client()
+    try:
+        s3_client.copy_object(
+            CopySource={'Bucket': source_bucket, 'Key': source_key},
+            Bucket=dest_bucket,
+            Key=dest_key
+        )
+        logger.info(f"Successfully copied s3://{source_bucket}/{source_key} to s3://{dest_bucket}/{dest_key}")
+    except ClientError as e:
+        logger.error(f"Error copying s3://{source_bucket}/{source_key} to s3://{dest_bucket}/{dest_key}: {str(e)}")
+        raise
+
 __all__ = ['upload_to_s3', 'download_from_s3', 'check_s3_object_exists',
-           'get_s3_object_info', 'check_s3_prefix_exists', 'list_s3_objects']
+           'get_s3_object_info', 'check_s3_prefix_exists', 'list_s3_objects',
+           'copy_s3_object']
