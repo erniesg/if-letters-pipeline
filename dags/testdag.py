@@ -1,5 +1,12 @@
 import logging
 logging.info("Loading testdag.py")
+import sys
+import os
+
+print(f"Python path: {sys.path}")
+print(f"Current working directory: {os.getcwd()}")
+print(f"Contents of current directory: {os.listdir('.')}")
+print(f"Contents of parent directory: {os.listdir('..')}")
 
 from airflow import DAG
 from airflow.operators.python_operator import PythonOperator

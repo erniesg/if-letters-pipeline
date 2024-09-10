@@ -5,7 +5,7 @@ FROM quay.io/astronomer/astro-runtime:${ASTRO_RUNTIME_VERSION}
 COPY . /usr/local/airflow
 
 # Set PYTHONPATH to include both /usr/local/airflow and the pipeline directory
-ENV PYTHONPATH="/usr/local/airflow:${PYTHONPATH}"
+ENV PYTHONPATH="/usr/local/airflow:/usr/local/airflow/dags:/usr/local/airflow/helpers:/usr/local/airflow/operators:${PYTHONPATH}"
 
 # Install any needed packages specified in requirements.txt
 COPY requirements.txt /tmp/requirements.txt
