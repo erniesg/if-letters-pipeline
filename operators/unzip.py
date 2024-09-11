@@ -13,7 +13,7 @@ import threading
 logger = logging.getLogger(__name__)
 
 class UnzipOperator(BaseOperator):
-    def __init__(self, dataset_name, s3_key, **kwargs):
+    def __init__(self, dataset_name, s3_key, max_pool_connections=None, max_concurrency=None, batch_size=None, chunk_size=None, **kwargs):
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
         self.s3_key = s3_key
@@ -23,13 +23,14 @@ class UnzipOperator(BaseOperator):
         self.destination_prefix = f"{self.s3_config['processed_folder']}/{self.dataset_name}"
         self.unzip_password = self.config['datasets'][dataset_name].get('unzip_password')
         self.processing_config = self.config.get('processing', {})
-        self.chunk_size = self.processing_config.get('chunk_size', 64 * 1024 * 1024)
-        self.max_concurrency = self.processing_config.get('max_concurrency', 32)
-        self.batch_size = self.processing_config.get('batch_size', 500)
+        self.chunk_size = chunk_size or self.processing_config.get('chunk_size', 64 * 1024 * 1024)
+        self.max_concurrency = max_concurrency or self.processing_config.get('max_concurrency', 32)
+        self.batch_size = batch_size or self.processing_config.get('batch_size', 500)
         self.multipart_threshold = self.processing_config.get('multipart_threshold', 8 * 1024 * 1024)
         self.multipart_chunksize = self.processing_config.get('multipart_chunksize', 8 * 1024 * 1024)
+        self.max_pool_connections = max_pool_connections or self.processing_config.get('max_pool_connections', 100)
         self.error_files = []
-        self.checkpoint_interval = 5000  # Increased checkpoint interval
+        self.checkpoint_interval = 5000
         self.progress_lock = threading.Lock()
         self.processed_files = 0
         self.total_files = 0
