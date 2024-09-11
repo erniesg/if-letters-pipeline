@@ -154,12 +154,22 @@ def copy_s3_object(source_bucket, source_key, dest_bucket, dest_key):
         logger.error(f"Error copying s3://{source_bucket}/{source_key} to s3://{dest_bucket}/{dest_key}: {str(e)}")
         raise
 
+# Add this new function at the beginning of the file, after the imports and config setup
+def get_s3_path(dataset_name, file_type='data', file_index=None):
+    if file_type == 'data':
+        base_path = f"{s3_config['data_prefix']}/{dataset_name}"
+        return f"{base_path}_{file_index}.zip" if file_index is not None else f"{base_path}.zip"
+    elif file_type == 'processed':
+        return f"{s3_config['processed_folder']}/{dataset_name}"
+    else:
+        raise ValueError(f"Invalid file_type: {file_type}")
+
+# Update the stream_download_from_s3 function
 @ensure_resource('s3')
 @handle_existing_item
-def stream_download_from_s3(bucket, key, chunk_size=None):
+def stream_download_from_s3(s3_client, bucket, key, chunk_size=None):
     if chunk_size is None:
         chunk_size = processing_config.get('chunk_size', 128 * 1024 * 1024)
-    s3_client = get_optimized_s3_client()
     response = s3_client.get_object(Bucket=bucket, Key=key)
     for chunk in response['Body'].iter_chunks(chunk_size=chunk_size):
         yield chunk
@@ -176,4 +186,4 @@ def multipart_upload_to_s3(s3_client, file_content, bucket, s3_key):
 
 __all__ = ['upload_to_s3', 'batch_upload_to_s3', 'download_from_s3', 'check_s3_object_exists',
            'get_s3_object_info', 'check_s3_prefix_exists', 'list_s3_objects',
-           'copy_s3_object', 'stream_download_from_s3', 'multipart_upload_to_s3']
+           'copy_s3_object', 'stream_download_from_s3', 'multipart_upload_to_s3', 'get_s3_path']

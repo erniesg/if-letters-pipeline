@@ -31,6 +31,13 @@ def create_dataset_dag(dataset_name, default_args):
 
         start = DummyOperator(task_id='start')
 
+        def get_download_path(dataset_name, file_index=None):
+            base_path = f"{s3_config['data_prefix']}/{dataset_name}"
+            return f"{base_path}_{file_index}.zip" if file_index is not None else f"{base_path}.zip"
+
+        def get_unzip_path(dataset_name):
+            return f"{s3_config['processed_folder']}/{dataset_name}"
+
         def check_and_create_job(task_id, dataset_name, operation, file_index=None, **context):
             execution_date = context['execution_date']
             job_id = f"{dataset_name}_{operation}_{execution_date}"
@@ -80,6 +87,8 @@ def create_dataset_dag(dataset_name, default_args):
                 task_id=task_id,
                 dataset_name=dataset_name,
                 s3_keys=s3_key,
+                s3_bucket=s3_config['bucket_name'],
+                destination_prefix=get_unzip_path(dataset_name),
                 max_concurrency=dataset_config.get('max_concurrency', processing_config.get('max_concurrency', 32)),
                 buffer_size=processing_config.get('buffer_size', 8*1024*1024),
                 buffer_pool_size=processing_config.get('buffer_pool_size', 64),
@@ -103,7 +112,7 @@ def create_dataset_dag(dataset_name, default_args):
                     op_kwargs={
                         'source': {'type': dataset_config['source']['type'], 'path': path},
                         's3_bucket': s3_config['bucket_name'],
-                        's3_key': f"{s3_config['data_prefix']}/{dataset_name}_{i}.zip",
+                        's3_key': get_download_path(dataset_name, i),
                         'dataset_name': dataset_name,
                         'job_id': f"{dataset_name}_download_{i}_{{{{ execution_date }}}}"
                     },
@@ -117,7 +126,7 @@ def create_dataset_dag(dataset_name, default_args):
                     provide_context=True
                 )
 
-                s3_key = f"{s3_config['data_prefix']}/{dataset_name}_{i}.zip"
+                s3_key = get_download_path(dataset_name, i)
                 unzip_task = create_unzip_task(dataset_name, s3_key, i)
 
                 start >> check_download >> download_task >> check_unzip >> unzip_task
@@ -136,7 +145,7 @@ def create_dataset_dag(dataset_name, default_args):
                 op_kwargs={
                     'source': dataset_config['source'],
                     's3_bucket': s3_config['bucket_name'],
-                    's3_key': f"{s3_config['data_prefix']}/{dataset_name}.zip",
+                    's3_key': get_download_path(dataset_name),
                     'dataset_name': dataset_name,
                     'job_id': f"{dataset_name}_download_{{{{ execution_date }}}}"
                 },
@@ -150,7 +159,7 @@ def create_dataset_dag(dataset_name, default_args):
                 provide_context=True
             )
 
-            s3_key = dataset_config['source']['path'] if dataset_config['source']['type'] == 's3' else f"{s3_config['data_prefix']}/{dataset_name}.zip"
+            s3_key = dataset_config['source']['path'] if dataset_config['source']['type'] == 's3' else get_download_path(dataset_name)
             unzip_task = create_unzip_task(dataset_name, s3_key)
 
             start >> check_download >> download_task >> check_unzip >> unzip_task
@@ -168,13 +177,18 @@ def create_dataset_dag(dataset_name, default_args):
 config = get_config()
 for dataset in config['datasets']:
     dag_id = f"{dataset}_elt_dag"
-    logger.info(f"Creating DAG: {dag_id}")
-    globals()[dag_id] = create_dataset_dag(
-        dataset,
-        default_args={
-            'owner': 'airflow',
-            'start_date': datetime(2023, 1, 1),
-            'retries': 0,
-            'retry_delay': timedelta(minutes=1),
-        }
-    )
+    logger.info(f"Starting creation of DAG: {dag_id}")
+    try:
+        globals()[dag_id] = create_dataset_dag(
+            dataset,
+            default_args={
+                'owner': 'airflow',
+                'start_date': datetime(2023, 1, 1),
+                'retries': 0,
+                'retry_delay': timedelta(minutes=1),
+            }
+        )
+        logger.info(f"Successfully created DAG: {dag_id}")
+    except Exception as e:
+        logger.error(f"Error creating DAG {dag_id}: {str(e)}")
+        raise
