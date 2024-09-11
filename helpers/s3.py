@@ -5,6 +5,7 @@ from helpers.config import get_config
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
+import boto3.s3.transfer
 from botocore.config import Config
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ def get_optimized_s3_client():
         retries={'max_attempts': 3, 'mode': 'adaptive'},
         max_pool_connections=processing_config.get('max_pool_connections', 50)
     )
-    return get_s3_client(config=config)
+    return boto3.client('s3', config=config)
 
 @ensure_resource('s3')
 @handle_existing_item
