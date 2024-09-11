@@ -8,6 +8,8 @@ from helpers.dynamodb import create_job, update_job_state, get_job_state
 from helpers.s3 import check_s3_object_exists, get_s3_object_info
 from helpers.config import get_config
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +78,18 @@ def create_dataset_dag(dataset_name, default_args):
             return result
 
         def process_unzip(dataset_name, **context):
-            batch_size = dataset_config.get('batch_size', processing_config.get('batch_size', 500))
-            num_workers = dataset_config.get('num_workers', processing_config.get('num_workers', 4))
-            max_pool_connections = processing_config.get('max_pool_connections', num_workers * 2)
-            max_concurrency = processing_config.get('max_concurrency', num_workers)
+            dataset_config = config['datasets'][dataset_name]
+            processing_config = config['processing']
+
+            # Get configuration values, with fallbacks to processing_config and then to default values
+            max_pool_connections = dataset_config.get('max_pool_connections',
+                                                      processing_config.get('max_pool_connections', 100))
+            max_concurrency = dataset_config.get('max_concurrency',
+                                                 processing_config.get('max_concurrency', 32))
+            batch_size = dataset_config.get('batch_size',
+                                            processing_config.get('batch_size', 1000))
+            chunk_size = dataset_config.get('chunk_size',
+                                            processing_config.get('chunk_size', 16 * 1024 * 1024))
 
             if isinstance(dataset_config['source']['path'], list):
                 unzip_tasks = []
@@ -91,7 +101,8 @@ def create_dataset_dag(dataset_name, default_args):
                         s3_key=s3_key,
                         max_pool_connections=max_pool_connections,
                         max_concurrency=max_concurrency,
-                        batch_size=batch_size
+                        batch_size=batch_size,
+                        chunk_size=chunk_size
                     )
                     unzip_tasks.append(unzip_task)
                 return unzip_tasks
@@ -103,10 +114,11 @@ def create_dataset_dag(dataset_name, default_args):
                     s3_key=s3_key,
                     max_pool_connections=max_pool_connections,
                     max_concurrency=max_concurrency,
-                    batch_size=batch_size
+                    batch_size=batch_size,
+                    chunk_size=chunk_size
                 )
 
-        def execute_unzip(s3_key, dataset_name, max_pool_connections, max_concurrency, batch_size, file_index=None, **context):
+        def execute_unzip(s3_key, dataset_name, file_index=None, **context):
             execution_date = context['execution_date']
             job_id = f"{dataset_name}_unzip_{execution_date}"
             if file_index is not None:
@@ -115,18 +127,48 @@ def create_dataset_dag(dataset_name, default_args):
             logger.info(f"Processing unzip for {dataset_name}")
             logger.info(f"S3 key: {s3_key}")
 
-            unzip_op = UnzipOperator(
-                task_id=f'unzip_{dataset_name}',
-                dataset_name=dataset_name,
-                s3_key=s3_key,
-                max_pool_connections=max_pool_connections,
-                max_concurrency=max_concurrency,
-                batch_size=batch_size
-            )
-            result = unzip_op.execute(context)
-            logger.info(f"Unzip result: {result}")
-            update_job_state(job_id, status="completed", progress=100, metadata=result)
-            return result
+            try:
+                # Get configuration values, with fallbacks to processing_config and then to default values
+                max_pool_connections = dataset_config.get('max_pool_connections',
+                                                        processing_config.get('max_pool_connections', 100))
+                max_concurrency = dataset_config.get('max_concurrency',
+                                                    processing_config.get('max_concurrency', 32))
+                batch_size = dataset_config.get('batch_size',
+                                                processing_config.get('batch_size', 1000))
+                # Increase chunk size to 32MB for more aggressive processing
+                chunk_size = dataset_config.get('chunk_size',
+                                                processing_config.get('chunk_size', 32 * 1024 * 1024))
+
+                unzip_op = UnzipOperator(
+                    task_id=f'unzip_{dataset_name}',
+                    dataset_name=dataset_name,
+                    s3_key=s3_key,
+                    max_pool_connections=max_pool_connections,
+                    max_concurrency=max_concurrency,
+                    batch_size=batch_size,
+                    chunk_size=chunk_size
+                )
+
+                update_job_state(job_id, status="started", progress=0)
+
+                result = unzip_op.execute(context)
+
+                logger.info(f"Unzip result: {result}")
+
+                if isinstance(result, dict) and result.get('status') == 'completed_with_errors':
+                    update_job_state(job_id, status="completed_with_errors", progress=100, metadata=result)
+                    logger.warning(f"Unzip operation completed with errors for {dataset_name}")
+                else:
+                    update_job_state(job_id, status="completed", progress=100, metadata=result)
+                    logger.info(f"Unzip operation completed successfully for {dataset_name}")
+
+                return result
+
+            except Exception as e:
+                logger.error(f"Unzip operation failed for {dataset_name}: {str(e)}")
+                logger.exception("Traceback:")
+                update_job_state(job_id, status="failed", progress=0, metadata={'error': str(e)})
+                raise
 
         if isinstance(dataset_config['source']['path'], list):
             download_tasks = []
