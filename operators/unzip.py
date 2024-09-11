@@ -1,12 +1,9 @@
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from airflow.models import BaseOperator
-from helpers.s3 import check_s3_prefix_exists, list_s3_objects
+from helpers.s3 import check_s3_prefix_exists, list_s3_objects, get_optimized_s3_client, batch_upload_to_s3
 from helpers.dynamodb import update_job_state
-from helpers.config import get_config, get_aws_credentials
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
+from helpers.config import get_config
 import logging
 import traceback
 import tempfile
@@ -31,30 +28,8 @@ class UnzipOperator(BaseOperator):
         self.max_concurrency = max_concurrency
         self.checkpoint_interval = 1000  # Save checkpoint every 1000 files
 
-    def get_s3_client(self):
-        config = Config(
-            retries={'max_attempts': 3, 'mode': 'adaptive'},
-            max_pool_connections=self.max_pool_connections
-        )
-        aws_credentials = get_aws_credentials()
-        return boto3.client('s3', config=config, **aws_credentials)
-
-    def upload_batch_to_s3(self, s3_client, batch):
-        with ThreadPoolExecutor(max_workers=min(len(batch), self.max_concurrency)) as executor:
-            futures = [executor.submit(self.upload_file_to_s3, s3_client, file_key, file_content)
-                       for file_key, file_content in batch]
-            for future in as_completed(futures):
-                future.result()
-
-    def upload_file_to_s3(self, s3_client, file_key, file_content):
-        try:
-            s3_client.put_object(Bucket=self.s3_bucket, Key=file_key, Body=file_content)
-        except ClientError as e:
-            logger.error(f"Error uploading file {file_key}: {str(e)}")
-            self.error_files.append({"file": file_key, "error": str(e)})
-
     def process_zip_content(self, job_id):
-        s3_client = self.get_s3_client()
+        s3_client = get_optimized_s3_client()
         processed_files = 0
         total_files = 0
         last_progress = -1
@@ -75,54 +50,56 @@ class UnzipOperator(BaseOperator):
                 total_files = len([f for f in zip_ref.namelist() if not f.endswith('/')])
             logger.info(f"Total files in zip: {total_files}")
 
-            with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-                batch = []
-                futures = []
-                for file_info in zip_ref.infolist()[processed_files:]:
-                    if file_info.filename.endswith('/'):  # Skip directories
-                        continue
+            batch = []
+            for file_info in zip_ref.infolist()[processed_files:]:
+                if file_info.filename.endswith('/'):  # Skip directories
+                    continue
 
-                    with zip_ref.open(file_info.filename, pwd=self.unzip_password.encode() if self.unzip_password else None) as file:
-                        file_content = file.read()
-                        file_key = f"{self.destination_prefix}/{file_info.filename}"
-                        batch.append((file_key, file_content))
+                with zip_ref.open(file_info.filename, pwd=self.unzip_password.encode() if self.unzip_password else None) as file:
+                    file_content = file.read()
+                    file_key = f"{self.destination_prefix}/{file_info.filename}"
+                    batch.append((file_key, file_content))
 
-                    if len(batch) >= self.batch_size:
-                        futures.append(executor.submit(self.upload_batch_to_s3, s3_client, batch))
-                        batch = []
+                if len(batch) >= self.batch_size:
+                    results = batch_upload_to_s3(batch, self.s3_bucket, max_workers=self.max_concurrency)
+                    self.handle_upload_results(results)
+                    batch = []
 
-                    processed_files += 1
+                processed_files += 1
 
-                    progress = int((processed_files / total_files) * 100)
-                    if progress in [0, 20, 40, 60, 80, 100] and progress != last_progress:
-                        logger.info(f"Unzip progress: {progress}% ({processed_files}/{total_files} files)")
-                        update_job_state(job_id, status='in_progress', progress=progress,
-                                         metadata={'processed_files': processed_files, 'total_files': total_files})
-                        last_progress = progress
+                progress = int((processed_files / total_files) * 100)
+                if progress in [0, 20, 40, 60, 80, 100] and progress != last_progress:
+                    logger.info(f"Unzip progress: {progress}% ({processed_files}/{total_files} files)")
+                    update_job_state(job_id, status='in_progress', progress=progress,
+                                     metadata={'processed_files': processed_files, 'total_files': total_files})
+                    last_progress = progress
 
-                    # Save checkpoint
-                    if processed_files % self.checkpoint_interval == 0:
-                        self.save_checkpoint(job_id, {'processed_files': processed_files, 'total_files': total_files})
+                # Save checkpoint
+                if processed_files % self.checkpoint_interval == 0:
+                    self.save_checkpoint(job_id, {'processed_files': processed_files, 'total_files': total_files})
 
-                if batch:
-                    futures.append(executor.submit(self.upload_batch_to_s3, s3_client, batch))
-
-                for future in as_completed(futures):
-                    future.result()
+            if batch:
+                results = batch_upload_to_s3(batch, self.s3_bucket, max_workers=self.max_concurrency)
+                self.handle_upload_results(results)
 
         os.unlink(temp_file_path)
         return processed_files, total_files
 
+    def handle_upload_results(self, results):
+        for s3_key, success in results:
+            if not success:
+                self.error_files.append({"file": s3_key, "error": "Upload failed"})
+
     def download_from_s3_streaming(self, bucket, key, file_object):
-        s3_client = self.get_s3_client()
+        s3_client = get_optimized_s3_client()
         try:
             s3_client.download_fileobj(Bucket=bucket, Key=key, Fileobj=file_object)
-        except ClientError as e:
+        except Exception as e:
             logger.error(f"Error downloading {key} from S3: {str(e)}")
             raise
 
     def save_checkpoint(self, job_id, data):
-        s3_client = self.get_s3_client()
+        s3_client = get_optimized_s3_client()
         checkpoint_key = f"{self.destination_prefix}/checkpoints/{job_id}.json"
         try:
             s3_client.put_object(
@@ -135,7 +112,7 @@ class UnzipOperator(BaseOperator):
             logger.error(f"Error saving checkpoint: {str(e)}")
 
     def load_checkpoint(self, job_id):
-        s3_client = self.get_s3_client()
+        s3_client = get_optimized_s3_client()
         checkpoint_key = f"{self.destination_prefix}/checkpoints/{job_id}.json"
         try:
             response = s3_client.get_object(Bucket=self.s3_bucket, Key=checkpoint_key)
