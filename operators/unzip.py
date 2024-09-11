@@ -1,5 +1,5 @@
 import boto3
-from stream_unzip import stream_unzip
+from stream_unzip import stream_unzip, UnfinishedIterationError
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
@@ -31,7 +31,13 @@ class StreamingZipProcessor:
                 self.zipped_chunks(),
                 password=self.unzip_password
             ):
-                yield file_name, file_size, unzipped_chunks
+                try:
+                    # Consume all chunks to avoid UnfinishedIterationError
+                    chunks = list(unzipped_chunks)
+                    yield file_name, file_size, chunks
+                except UnfinishedIterationError:
+                    logger.warning(f"UnfinishedIterationError for file {file_name}. Skipping this file.")
+                    continue
         except Exception as e:
             logger.error(f"Error in StreamingZipProcessor.process(): {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
