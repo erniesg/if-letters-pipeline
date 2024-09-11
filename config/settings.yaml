@@ -39,9 +39,9 @@ processing:
   batch_size: 500
   max_pool_connections: 100
   max_concurrency: 32
-  chunk_size: 67108864  # 64MB
-  multipart_threshold: 8388608  # 8MB
-  multipart_chunksize: 8388608  # 8MB
+  chunk_size: 134217728  # 64MB
+  multipart_threshold: 16777216  # 8MB
+  multipart_chunksize: 16777216  # 8MB
 
 dynamodb:
   table_name: ETLJobTracker

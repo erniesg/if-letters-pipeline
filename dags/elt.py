@@ -83,13 +83,13 @@ def create_dataset_dag(dataset_name, default_args):
 
             # Get configuration values, with fallbacks to processing_config and then to default values
             max_pool_connections = dataset_config.get('max_pool_connections',
-                                                      processing_config.get('max_pool_connections', 100))
+                                                      processing_config.get('max_pool_connections', 200))
             max_concurrency = dataset_config.get('max_concurrency',
-                                                 processing_config.get('max_concurrency', 32))
+                                                 processing_config.get('max_concurrency', 64))
             batch_size = dataset_config.get('batch_size',
                                             processing_config.get('batch_size', 1000))
             chunk_size = dataset_config.get('chunk_size',
-                                            processing_config.get('chunk_size', 16 * 1024 * 1024))
+                                            processing_config.get('chunk_size', 128 * 1024 * 1024))
 
             if isinstance(dataset_config['source']['path'], list):
                 unzip_tasks = []
@@ -130,14 +130,13 @@ def create_dataset_dag(dataset_name, default_args):
             try:
                 # Get configuration values, with fallbacks to processing_config and then to default values
                 max_pool_connections = dataset_config.get('max_pool_connections',
-                                                        processing_config.get('max_pool_connections', 100))
+                                                        processing_config.get('max_pool_connections', 200))
                 max_concurrency = dataset_config.get('max_concurrency',
-                                                    processing_config.get('max_concurrency', 32))
+                                                    processing_config.get('max_concurrency', 64))
                 batch_size = dataset_config.get('batch_size',
                                                 processing_config.get('batch_size', 1000))
-                # Increase chunk size to 32MB for more aggressive processing
                 chunk_size = dataset_config.get('chunk_size',
-                                                processing_config.get('chunk_size', 32 * 1024 * 1024))
+                                                processing_config.get('chunk_size', 128 * 1024 * 1024))
 
                 unzip_op = UnzipOperator(
                     task_id=f'unzip_{dataset_name}',

@@ -18,16 +18,16 @@ processing_config = config.get('processing', {})
 # Update the transfer_config to use the new settings
 def get_transfer_config(max_concurrency=None, multipart_threshold=None, multipart_chunksize=None):
     return boto3.s3.transfer.TransferConfig(
-        multipart_threshold=multipart_threshold or processing_config.get('multipart_threshold', 8 * 1024 * 1024),
-        max_concurrency=max_concurrency or processing_config.get('max_concurrency', 32),
-        multipart_chunksize=multipart_chunksize or processing_config.get('multipart_chunksize', 8 * 1024 * 1024),
+        multipart_threshold=multipart_threshold or processing_config.get('multipart_threshold', 16 * 1024 * 1024),
+        max_concurrency=max_concurrency or processing_config.get('max_concurrency', 64),
+        multipart_chunksize=multipart_chunksize or processing_config.get('multipart_chunksize', 16 * 1024 * 1024),
         use_threads=True
     )
 
 def get_optimized_s3_client():
     config = Config(
-        retries={'max_attempts': 3, 'mode': 'adaptive'},
-        max_pool_connections=processing_config.get('max_pool_connections', 50)
+        retries={'max_attempts': 5, 'mode': 'adaptive'},
+        max_pool_connections=processing_config.get('max_pool_connections', 200)
     )
     return boto3.client('s3', config=config)
 
@@ -46,7 +46,7 @@ def upload_to_s3(content, bucket, s3_key):
 @ensure_resource('s3')
 def batch_upload_to_s3(file_list, bucket, max_workers=None, multipart_threshold=None, multipart_chunksize=None):
     if max_workers is None:
-        max_workers = processing_config.get('max_concurrency', 16)
+        max_workers = processing_config.get('max_concurrency', 64)
 
     s3_client = get_optimized_s3_client()
     transfer_config = get_transfer_config(max_workers, multipart_threshold, multipart_chunksize)
@@ -130,8 +130,11 @@ def check_s3_prefix_exists(bucket, prefix):
 def list_s3_objects(bucket, prefix):
     try:
         s3_client = get_optimized_s3_client()
-        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-        return response.get('Contents', [])
+        paginator = s3_client.get_paginator('list_objects_v2')
+        objects = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            objects.extend(page.get('Contents', []))
+        return objects
     except ClientError as e:
         logger.error(f"Error listing objects in s3://{bucket}/{prefix}: {str(e)}")
         return []
@@ -155,12 +158,22 @@ def copy_s3_object(source_bucket, source_key, dest_bucket, dest_key):
 @handle_existing_item
 def stream_download_from_s3(bucket, key, chunk_size=None):
     if chunk_size is None:
-        chunk_size = processing_config.get('chunk_size', 8 * 1024 * 1024)
+        chunk_size = processing_config.get('chunk_size', 128 * 1024 * 1024)
     s3_client = get_optimized_s3_client()
     response = s3_client.get_object(Bucket=bucket, Key=key)
     for chunk in response['Body'].iter_chunks(chunk_size=chunk_size):
         yield chunk
 
+def multipart_upload_to_s3(s3_client, file_content, bucket, s3_key):
+    transfer_config = get_transfer_config()
+    try:
+        s3_client.upload_fileobj(BytesIO(file_content), bucket, s3_key, Config=transfer_config)
+        logger.info(f"Successfully uploaded to s3://{bucket}/{s3_key}")
+        return True
+    except ClientError as e:
+        logger.error(f"Error uploading to s3://{bucket}/{s3_key}: {str(e)}")
+        return False
+
 __all__ = ['upload_to_s3', 'batch_upload_to_s3', 'download_from_s3', 'check_s3_object_exists',
            'get_s3_object_info', 'check_s3_prefix_exists', 'list_s3_objects',
-           'copy_s3_object', 'stream_download_from_s3']
+           'copy_s3_object', 'stream_download_from_s3', 'multipart_upload_to_s3']
