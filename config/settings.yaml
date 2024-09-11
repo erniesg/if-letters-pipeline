@@ -17,7 +17,7 @@ datasets:
       type: s3
       path: data/M5HisDoc.zip
     unzip_password: ${M5HISDOC_PASSWORD}
-    batch_size: 100
+    batch_size: 50
   casia-hwdb:
     source:
       type: url
