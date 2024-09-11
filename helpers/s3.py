@@ -69,34 +69,36 @@ def stream_download_from_s3(s3_client, bucket, key, chunk_size=None):
     except ClientError as e:
         logger.error(f"Error streaming from s3://{bucket}/{key}: {str(e)}")
         raise
+    except Exception as e:
+        logger.error(f"Unexpected error streaming from s3://{bucket}/{key}: {str(e)}")
+        raise
 
-def bulk_upload_to_s3(s3_client, file_batches, bucket, max_workers=None):
+def bulk_upload_to_s3(s3_client, batch, bucket, max_workers=None):
     if max_workers is None:
         max_workers = processing_config.get('max_concurrency', 64)
 
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_batch = {executor.submit(upload_batch, s3_client, batch, bucket): i for i, batch in enumerate(file_batches)}
-        for future in as_completed(future_to_batch):
-            batch_index = future_to_batch[future]
+        futures = [executor.submit(upload_single_file, s3_client, file_name, file_content, bucket)
+                   for file_name, file_content in batch]
+        for future in as_completed(futures):
             try:
-                results.extend(future.result())
+                result = future.result()
+                results.append(result)
             except Exception as e:
-                logger.error(f"Error uploading batch {batch_index}: {str(e)}")
-                results.extend([(f"batch_{batch_index}", False)])
+                logger.error(f"Error in bulk upload: {str(e)}")
+                results.append((str(e), False))
 
     return results
 
-def upload_batch(s3_client, batch, bucket):
-    results = []
-    for file_name, file_content in batch:
-        try:
-            s3_client.put_object(Body=file_content, Bucket=bucket, Key=file_name)
-            results.append((file_name, True))
-        except ClientError as e:
-            logger.error(f"Error uploading file {file_name} to s3://{bucket}: {str(e)}")
-            results.append((file_name, False))
-    return results
+def upload_single_file(s3_client, file_name, file_content, bucket):
+    try:
+        s3_client.put_object(Body=file_content, Bucket=bucket, Key=file_name)
+        logger.info(f"Uploaded: {file_name}")
+        return (file_name, True)
+    except Exception as e:
+        logger.error(f"Error uploading file {file_name} to s3://{bucket}: {str(e)}")
+        return (file_name, False)
 
 def stream_unzip_and_upload(s3_client, source_bucket, source_key, dest_bucket, dest_prefix,
                             batch_size=1000, max_workers=64, concurrent_batches=8, unzip_password=None):
@@ -116,7 +118,7 @@ def stream_unzip_and_upload(s3_client, source_bucket, source_key, dest_bucket, d
             batch = upload_queue.get()
             if batch is None:
                 break
-            bulk_upload_to_s3(s3_client, [batch], dest_bucket, max_workers)
+            bulk_upload_to_s3(s3_client, batch, dest_bucket, max_workers)
             upload_queue.task_done()
 
     # Start batch processing thread
@@ -133,33 +135,36 @@ def stream_unzip_and_upload(s3_client, source_bucket, source_key, dest_bucket, d
     current_batch = []
     total_files = 0
 
-    for chunk in stream_download_from_s3(s3_client, source_bucket, source_key):
-        for file_name, file_size, unzipped_chunks in stream_unzip(chunk, password=unzip_password):
-            if isinstance(file_name, bytes):
-                file_name = file_name.decode('utf-8')
-            dest_key = f"{dest_prefix}/{file_name}"
+    try:
+        for chunk in stream_download_from_s3(s3_client, source_bucket, source_key):
+            for file_name, file_size, unzipped_chunks in stream_unzip(chunk, password=unzip_password):
+                if isinstance(file_name, bytes):
+                    file_name = file_name.decode('utf-8')
+                dest_key = f"{dest_prefix}/{file_name}"
 
-            current_batch.append((dest_key, b''.join(unzipped_chunks)))
-            total_files += 1
+                current_batch.append((dest_key, b''.join(unzipped_chunks)))
+                total_files += 1
 
-            if len(current_batch) >= batch_size:
-                batch_queue.put(current_batch)
-                current_batch = []
+                if len(current_batch) >= batch_size:
+                    batch_queue.put(current_batch)
+                    current_batch = []
 
-    if current_batch:
-        batch_queue.put(current_batch)
+        if current_batch:
+            batch_queue.put(current_batch)
+    except Exception as e:
+        logger.error(f"Error in stream_unzip_and_upload: {str(e)}")
+    finally:
+        # Signal the end of processing
+        batch_queue.put(None)
+        batch_thread.join()
 
-    # Signal the end of processing
-    batch_queue.put(None)
-    batch_thread.join()
+        # Signal the end of batches
+        for _ in range(concurrent_batches):
+            upload_queue.put(None)
 
-    # Signal the end of batches
-    for _ in range(concurrent_batches):
-        upload_queue.put(None)
-
-    # Wait for all upload threads to complete
-    for t in upload_threads:
-        t.join()
+        # Wait for all upload threads to complete
+        for t in upload_threads:
+            t.join()
 
     return total_files
 

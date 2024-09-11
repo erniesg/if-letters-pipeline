@@ -1,50 +1,22 @@
 import boto3
-from stream_unzip import stream_unzip, UnfinishedIterationError
+from stream_unzip import stream_unzip
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Thread
 from airflow.models import BaseOperator
-from helpers.s3 import bulk_upload_to_s3, get_optimized_s3_client, stream_download_from_s3, check_s3_prefix_exists, list_s3_objects
+from helpers.s3 import bulk_upload_to_s3, get_optimized_s3_client, stream_download_from_s3
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config
 import logging
 import time
 from decimal import Decimal
 import traceback
+from http.client import IncompleteRead as http_incompleteRead
+from urllib3.exceptions import IncompleteRead as urllib3_incompleteRead
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-
-class StreamingZipProcessor:
-    def __init__(self, s3_client, source_bucket, source_key, dest_bucket, dest_prefix, unzip_password=None):
-        self.s3_client = s3_client
-        self.source_bucket = source_bucket
-        self.source_key = source_key
-        self.dest_bucket = dest_bucket
-        self.dest_prefix = dest_prefix
-        self.unzip_password = unzip_password.encode('utf-8') if unzip_password else None
-
-    def process(self):
-        logger.debug(f"Processing zip file: s3://{self.source_bucket}/{self.source_key}")
-        try:
-            for file_name, file_size, unzipped_chunks in stream_unzip(
-                self.zipped_chunks(),
-                password=self.unzip_password
-            ):
-                try:
-                    # Consume all chunks to avoid UnfinishedIterationError
-                    chunks = list(unzipped_chunks)
-                    yield file_name, file_size, chunks
-                except UnfinishedIterationError:
-                    logger.warning(f"UnfinishedIterationError for file {file_name}. Skipping this file.")
-                    continue
-        except Exception as e:
-            logger.error(f"Error in StreamingZipProcessor.process(): {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
-
-    def zipped_chunks(self):
-        return stream_download_from_s3(self.s3_client, self.source_bucket, self.source_key)
 
 class UnzipOperator(BaseOperator):
     def __init__(
@@ -53,9 +25,6 @@ class UnzipOperator(BaseOperator):
         s3_keys,
         s3_bucket,
         destination_prefix,
-        max_concurrency=64,
-        batch_size=1000,
-        concurrent_batches=8,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -63,14 +32,25 @@ class UnzipOperator(BaseOperator):
         self.s3_keys = s3_keys if isinstance(s3_keys, list) else [s3_keys]
         self.s3_bucket = s3_bucket
         self.destination_prefix = destination_prefix
+
+        # Get configuration
         self.config = get_config()
-        self.unzip_password = self.config['datasets'][dataset_name].get('unzip_password')
-        self.max_concurrency = max_concurrency
-        self.batch_size = batch_size
-        self.concurrent_batches = concurrent_batches
-        self.error_files = []
+        dataset_config = self.config['datasets'].get(dataset_name, {})
+        processing_config = self.config['processing']
+
+        # Set parameters from config
+        self.unzip_password = dataset_config.get('unzip_password')
+        self.max_concurrency = dataset_config.get('max_concurrency', processing_config.get('max_concurrency', 64))
+        self.batch_size = dataset_config.get('batch_size', processing_config.get('batch_size', 1000))
+        self.concurrent_batches = dataset_config.get('concurrent_batches', processing_config.get('concurrent_batches', 8))
+        self.chunk_size = processing_config.get('chunk_size', 268435456)  # 64MB default
+
         self.processed_files = 0
         self.total_files = 0
+        self.error_files = []
+        self.current_offset = 0
+        self.retry_count = 0
+        self.max_retries = 5
 
     def execute(self, context):
         job_id = f"{self.dataset_name}_unzip_{context['execution_date']}"
@@ -78,13 +58,6 @@ class UnzipOperator(BaseOperator):
         s3_client = get_optimized_s3_client()
 
         try:
-            if check_s3_prefix_exists(self.s3_bucket, self.destination_prefix):
-                existing_files = list_s3_objects(self.s3_bucket, self.destination_prefix)
-                logger.info(f"Files already exist in destination: {self.destination_prefix}")
-                logger.info(f"Number of existing files: {len(existing_files)}")
-                update_job_state(job_id, status='completed', progress=100, metadata={'existing_files': len(existing_files)})
-                return
-
             update_job_state(job_id, status='in_progress', progress=0)
             logger.info(f"Starting streaming unzip operation for {len(self.s3_keys)} files")
 
@@ -115,92 +88,101 @@ class UnzipOperator(BaseOperator):
 
         except Exception as e:
             logger.error(f"Unzip operation failed: {str(e)}")
+            logger.error(traceback.format_exc())
             update_job_state(job_id, status='failed', progress=0, metadata={'error': str(e)})
             raise
 
     def process_zip_file(self, s3_client, s3_key, job_id, start_time):
         logger.info(f"Processing file: s3://{self.s3_bucket}/{s3_key}")
-        try:
-            processor = StreamingZipProcessor(
-                s3_client, self.s3_bucket, s3_key,
-                self.s3_bucket, self.destination_prefix, self.unzip_password
-            )
 
-            batch_queue = Queue(maxsize=self.concurrent_batches * 2)
+        batch_queue = Queue(maxsize=self.concurrent_batches)
 
-            with ThreadPoolExecutor(max_workers=self.concurrent_batches) as executor:
-                futures = []
-                for _ in range(self.concurrent_batches):
-                    futures.append(executor.submit(self.process_batches, s3_client, batch_queue, job_id, start_time))
+        # Start the upload thread
+        upload_thread = Thread(target=self.upload_batches, args=(s3_client, batch_queue, job_id, start_time))
+        upload_thread.start()
 
-                current_batch = []
-                for file_name, file_size, unzipped_chunks in processor.process():
-                    try:
-                        self.total_files += 1
-                        if isinstance(file_name, bytes):
-                            file_name = file_name.decode('utf-8')
-                        dest_key = f"{self.destination_prefix}/{file_name}"
+        self.current_batch = []
+        self.current_offset = 0
+        self.retry_count = 0
 
-                        current_batch.append((dest_key, unzipped_chunks, file_size))
+        while self.retry_count < self.max_retries:
+            try:
+                for file_name, file_size, unzipped_chunks in stream_unzip(
+                    self.stream_download_from_s3(s3_client, self.s3_bucket, s3_key, start_byte=self.current_offset),
+                    password=self.unzip_password.encode('utf-8') if self.unzip_password else None
+                ):
+                    self.total_files += 1
+                    if isinstance(file_name, bytes):
+                        file_name = file_name.decode('utf-8')
+                    dest_key = f"{self.destination_prefix}/{file_name}"
 
-                        if len(current_batch) >= self.batch_size:
-                            batch_queue.put(current_batch)
-                            current_batch = []
+                    # Collect all chunks into a single bytes object
+                    file_content = b''.join(unzipped_chunks)
 
-                        if self.total_files % 10000 == 0:
-                            self.log_progress(job_id, start_time)
-                    except Exception as e:
-                        logger.error(f"Error processing file {file_name}: {str(e)}")
-                        self.error_files.append({"file": file_name, "error": str(e)})
+                    self.current_batch.append((dest_key, file_content))
 
-                if current_batch:
-                    batch_queue.put(current_batch)
+                    if len(self.current_batch) >= self.batch_size:
+                        batch_queue.put(self.current_batch)
+                        self.current_batch = []
 
-                for _ in range(self.concurrent_batches):
-                    batch_queue.put(None)
+                    if self.total_files % 10000 == 0:
+                        self.log_progress(job_id, start_time)
 
-                for future in as_completed(futures):
-                    future.result()
+                    # Update the current offset
+                    self.current_offset += file_size
 
-        except Exception as e:
-            logger.error(f"Error processing zip file {s3_key}: {str(e)}")
-            self.error_files.append({"file": s3_key, "error": str(e)})
-
-    def process_batches(self, s3_client, batch_queue, job_id, start_time):
-        while True:
-            batch = batch_queue.get()
-            if batch is None:
+                # If we've made it here, we've successfully processed the entire file
                 break
-            self.upload_batch(s3_client, batch)
-            batch_queue.task_done()
-            self.log_progress(job_id, start_time)
 
-    def upload_batch(self, s3_client, batch):
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-            futures = []
-            for dest_key, unzipped_chunks, file_size in batch:
-                futures.append(executor.submit(
-                    self.upload_file,
-                    s3_client, dest_key, unzipped_chunks, file_size
-                ))
+            except (http_incompleteRead, urllib3_incompleteRead, ClientError) as e:
+                self.retry_count += 1
+                wait_time = 2 ** self.retry_count
+                logger.warning(f"Incomplete Read error: {str(e)}. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
 
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                    self.processed_files += 1
-                except Exception as e:
-                    logger.error(f"Error uploading file: {str(e)}")
-                    self.error_files.append({"file": "unknown", "error": str(e)})
+            except Exception as e:
+                logger.error(f"Error processing zip file {s3_key}: {str(e)}")
+                logger.error(traceback.format_exc())
+                self.error_files.append({"file": s3_key, "error": str(e)})
+                break
 
-    def upload_file(self, s3_client, dest_key, unzipped_chunks, file_size):
+        # Put any remaining files in the last batch
+        if self.current_batch:
+            batch_queue.put(self.current_batch)
+
+        # Signal that we're done processing
+        batch_queue.put(None)
+        upload_thread.join()
+
+    def stream_download_from_s3(self, s3_client, bucket, key, start_byte=0):
         try:
-            if file_size < 314572800:  # 300MB
-                bulk_upload_to_s3(s3_client, [(dest_key, b''.join(unzipped_chunks))], self.s3_bucket)
-            else:
-                s3_client.upload_fileobj(BytesIO(b''.join(unzipped_chunks)), self.s3_bucket, dest_key)
-        except Exception as e:
-            logger.error(f"Error uploading file {dest_key}: {str(e)}")
+            response = s3_client.get_object(Bucket=bucket, Key=key, Range=f'bytes={start_byte}-')
+            for chunk in response['Body'].iter_chunks(chunk_size=self.chunk_size):
+                yield chunk
+        except ClientError as e:
+            logger.error(f"Error streaming from s3://{bucket}/{key}: {str(e)}")
             raise
+
+    def upload_batches(self, s3_client, batch_queue, job_id, start_time):
+        with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
+            while True:
+                batch = batch_queue.get()
+                if batch is None:
+                    break
+                executor.submit(self.upload_batch, s3_client, batch, job_id, start_time)
+                batch_queue.task_done()
+
+    def upload_batch(self, s3_client, batch, job_id, start_time):
+        try:
+            bulk_upload_to_s3(s3_client, batch, self.s3_bucket)
+            self.processed_files += len(batch)
+            self.log_progress(job_id, start_time)
+        except Exception as e:
+            logger.error(f"Error uploading batch: {str(e)}")
+            logger.error(traceback.format_exc())
+            for dest_key, _ in batch:
+                self.error_files.append({"file": dest_key, "error": str(e)})
 
     def log_progress(self, job_id, start_time, force=False):
         current_time = time.time()

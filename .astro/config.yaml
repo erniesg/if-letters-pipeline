@@ -1,2 +1,3 @@
 project:
     name: if-letters-pipeline
+    dag_deploy_enabled: true

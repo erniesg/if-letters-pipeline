@@ -18,7 +18,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Set PYTHONPATH to include the new AIRFLOW_HOME
-ENV PYTHONPATH="${PYTHONPATH}:${AIRFLOW_HOME}"
+ENV PYTHONPATH "${PYTHONPATH}:${AIRFLOW_HOME}:/opt/airflow/operators:/opt/airflow/helpers"
 
 # Switch back to the astro user
 USER astro

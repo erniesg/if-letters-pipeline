@@ -5,7 +5,7 @@ from airflow.operators.python_operator import PythonOperator
 from operators.download import DownloadOperator
 from operators.unzip import UnzipOperator
 from helpers.dynamodb import create_job, update_job_state, get_job_state
-from helpers.s3 import check_s3_object_exists, get_s3_object_info
+from helpers.s3 import check_s3_object_exists, get_s3_object_info, check_s3_prefix_exists
 from helpers.config import get_config
 import logging
 
@@ -48,6 +48,13 @@ def create_dataset_dag(dataset_name, default_args):
             if job_state and job_state['status'] == 'completed':
                 logger.info(f"Job {job_id} already completed. Skipping.")
                 return 'skip'
+            if operation == 'unzip':
+                destination_prefix = get_unzip_path(dataset_name)
+                if check_s3_prefix_exists(s3_config['bucket_name'], destination_prefix):
+                    logger.info(f"Unzip operation for {dataset_name} already completed. Skipping.")
+                    create_job(job_id, dataset_name, operation)
+                    update_job_state(job_id, status="completed", progress=100)
+                    return 'skip'
             logger.info(f"Creating new job: {job_id}")
             create_job(job_id, dataset_name, operation)
             return job_id
@@ -88,10 +95,7 @@ def create_dataset_dag(dataset_name, default_args):
                 dataset_name=dataset_name,
                 s3_keys=s3_key,
                 s3_bucket=s3_config['bucket_name'],
-                destination_prefix=get_unzip_path(dataset_name),
-                max_concurrency=dataset_config.get('max_concurrency', processing_config.get('max_concurrency', 64)),
-                batch_size=dataset_config.get('batch_size', processing_config.get('batch_size', 1000)),
-                concurrent_batches=dataset_config.get('concurrent_batches', processing_config.get('concurrent_batches', 8))
+                destination_prefix=get_unzip_path(dataset_name)
             )
 
         if isinstance(dataset_config['source']['path'], list):
