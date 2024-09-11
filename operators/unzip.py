@@ -100,9 +100,6 @@ class UnzipOperator(BaseOperator):
 
             if self.error_files:
                 logger.warning(f"Encountered errors with {len(self.error_files)} files.")
-                for error in self.error_files[:10]:  # Log first 10 errors
-                    logger.error(f"Error in file {error['file']}: {error['error']}")
-
                 update_job_state(job_id, status='completed_with_errors', progress=100,
                                  metadata={'processed_files': self.processed_files, 'total_files': self.total_files,
                                            'error_files': len(self.error_files), 'first_10_errors': self.error_files[:10]})
@@ -164,13 +161,12 @@ class UnzipOperator(BaseOperator):
 
         except Exception as e:
             logger.error(f"Error processing zip file {s3_key}: {str(e)}")
-            self.error_files.append({"file": s3_key, "error": str(e)}")
+            self.error_files.append({"file": s3_key, "error": str(e)})
 
     def upload_batch(self, s3_client, batch):
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
             futures = []
             for s3_key, file_content, file_size in batch:
-                # If file_size is None or not a valid integer, pass None
                 try:
                     file_size = int(file_size) if file_size is not None else None
                 except ValueError:
