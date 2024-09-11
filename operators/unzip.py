@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Thread
 from airflow.models import BaseOperator
-from helpers.s3 import bulk_upload_to_s3, get_optimized_s3_client, stream_download_from_s3
+from helpers.s3 import bulk_upload_to_s3, get_optimized_s3_client, stream_download_from_s3, check_s3_prefix_exists, list_s3_objects
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config
 import logging
@@ -72,6 +72,13 @@ class UnzipOperator(BaseOperator):
         s3_client = get_optimized_s3_client()
 
         try:
+            if check_s3_prefix_exists(self.s3_bucket, self.destination_prefix):
+                existing_files = list_s3_objects(self.s3_bucket, self.destination_prefix)
+                logger.info(f"Files already exist in destination: {self.destination_prefix}")
+                logger.info(f"Number of existing files: {len(existing_files)}")
+                update_job_state(job_id, status='completed', progress=100, metadata={'existing_files': len(existing_files)})
+                return
+
             update_job_state(job_id, status='in_progress', progress=0)
             logger.info(f"Starting streaming unzip operation for {len(self.s3_keys)} files")
 
