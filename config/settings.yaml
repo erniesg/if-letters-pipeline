@@ -17,7 +17,7 @@ datasets:
       type: s3
       path: data/M5HisDoc.zip
     unzip_password: ${M5HISDOC_PASSWORD}
-    batch_size: 250
+    batch_size: 1000
   casia-hwdb:
     source:
       type: url
@@ -35,15 +35,16 @@ datasets:
     batch_size: 100
 
 processing:
-  num_workers: 32
-  batch_size: 500
-  max_pool_connections: 100
-  max_concurrency: 32
-  chunk_size: 134217728  # 64MB
-  multipart_threshold: 16777216  # 8MB
-  multipart_chunksize: 16777216  # 8MB
-  buffer_size: 8388608  # 8MB (8 * 1024 * 1024)
-  buffer_pool_size: 64
+  num_workers: 64
+  batch_size: 1000
+  max_pool_connections: 500
+  max_concurrency: 64
+  concurrent_batches: 8  # New parameter for controlling concurrent batch processing
+  chunk_size: 268435456  # 64MB
+  multipart_threshold: 33554432  # 8MB
+  multipart_chunksize: 33554432  # 8MB
+  buffer_size: 16777216  # 8MB (8 * 1024 * 1024)
+  buffer_pool_size: 128
 
 dynamodb:
   table_name: ETLJobTracker

@@ -89,8 +89,9 @@ def create_dataset_dag(dataset_name, default_args):
                 s3_keys=s3_key,
                 s3_bucket=s3_config['bucket_name'],
                 destination_prefix=get_unzip_path(dataset_name),
-                max_concurrency=dataset_config.get('max_concurrency', processing_config.get('max_concurrency', 32)),
-                batch_size=dataset_config.get('batch_size', processing_config.get('batch_size', 100)),
+                max_concurrency=dataset_config.get('max_concurrency', processing_config.get('max_concurrency', 64)),
+                batch_size=dataset_config.get('batch_size', processing_config.get('batch_size', 1000)),
+                concurrent_batches=dataset_config.get('concurrent_batches', processing_config.get('concurrent_batches', 8))
             )
 
         if isinstance(dataset_config['source']['path'], list):

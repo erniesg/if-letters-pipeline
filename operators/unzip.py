@@ -1,10 +1,11 @@
 import boto3
-from stream_unzip import stream_unzip, NO_ENCRYPTION, ZIP_CRYPTO, AE_1, AE_2, AES_128, AES_192, AES_256
+from stream_unzip import stream_unzip
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
+from threading import Thread
 from airflow.models import BaseOperator
-from helpers.s3 import multipart_upload_to_s3, get_optimized_s3_client, check_s3_prefix_exists, list_s3_objects, stream_download_from_s3
+from helpers.s3 import multipart_upload_to_s3, get_optimized_s3_client, stream_download_from_s3
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config
 import logging
@@ -27,16 +28,7 @@ class StreamingZipProcessor:
         try:
             for file_name, file_size, unzipped_chunks in stream_unzip(
                 self.zipped_chunks(),
-                password=self.unzip_password,
-                allowed_encryption_mechanisms=(
-                    NO_ENCRYPTION,
-                    ZIP_CRYPTO,
-                    AE_1,
-                    AE_2,
-                    AES_128,
-                    AES_192,
-                    AES_256,
-                )
+                password=self.unzip_password
             ):
                 yield file_name, file_size, unzipped_chunks
         except Exception as e:
@@ -53,8 +45,9 @@ class UnzipOperator(BaseOperator):
         s3_keys,
         s3_bucket,
         destination_prefix,
-        max_concurrency=32,
-        batch_size=100,
+        max_concurrency=64,
+        batch_size=1000,
+        concurrent_batches=8,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -66,6 +59,7 @@ class UnzipOperator(BaseOperator):
         self.unzip_password = self.config['datasets'][dataset_name].get('unzip_password')
         self.max_concurrency = max_concurrency
         self.batch_size = batch_size
+        self.concurrent_batches = concurrent_batches
         self.error_files = []
         self.processed_files = 0
         self.total_files = 0
@@ -76,25 +70,13 @@ class UnzipOperator(BaseOperator):
         s3_client = get_optimized_s3_client()
 
         try:
-            if check_s3_prefix_exists(self.s3_bucket, self.destination_prefix):
-                existing_files = list_s3_objects(self.s3_bucket, self.destination_prefix)
-                logger.info(f"Files already exist in destination: {self.destination_prefix}")
-                logger.info(f"Number of existing files: {len(existing_files)}")
-                update_job_state(job_id, status='completed', progress=100, metadata={'existing_files': len(existing_files)})
-                return
-
             update_job_state(job_id, status='in_progress', progress=0)
             logger.info(f"Starting streaming unzip operation for {len(self.s3_keys)} files")
 
             start_time = time.time()
 
-            with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-                futures = []
-                for s3_key in self.s3_keys:
-                    futures.append(executor.submit(self.process_single_file, s3_client, s3_key, job_id, start_time))
-
-                for future in as_completed(futures):
-                    future.result()
+            for s3_key in self.s3_keys:
+                self.process_zip_file(s3_client, s3_key, job_id, start_time)
 
             self.log_progress(job_id, start_time, force=True)
 
@@ -121,7 +103,7 @@ class UnzipOperator(BaseOperator):
             update_job_state(job_id, status='failed', progress=0, metadata={'error': str(e)})
             raise
 
-    def process_single_file(self, s3_client, s3_key, job_id, start_time):
+    def process_zip_file(self, s3_client, s3_key, job_id, start_time):
         logger.info(f"Processing file: s3://{self.s3_bucket}/{s3_key}")
         try:
             processor = StreamingZipProcessor(
@@ -129,53 +111,62 @@ class UnzipOperator(BaseOperator):
                 self.s3_bucket, self.destination_prefix, self.unzip_password
             )
 
-            batch = []
-            for file_name, file_size, unzipped_chunks in processor.process():
-                try:
-                    self.total_files += 1
-                    if isinstance(file_name, bytes):
-                        file_name = file_name.decode('utf-8')
-                    s3_key = f"{self.destination_prefix}/{file_name}"
+            batch_queue = Queue(maxsize=self.concurrent_batches * 2)
 
-                    buffer = BytesIO()
-                    for chunk in unzipped_chunks:
-                        buffer.write(chunk)
-                    buffer.seek(0)
+            with ThreadPoolExecutor(max_workers=self.concurrent_batches) as executor:
+                futures = []
+                for _ in range(self.concurrent_batches):
+                    futures.append(executor.submit(self.process_batches, s3_client, batch_queue, job_id, start_time))
 
-                    file_size = int(file_size) if file_size is not None else None
+                current_batch = []
+                for file_name, file_size, unzipped_chunks in processor.process():
+                    try:
+                        self.total_files += 1
+                        if isinstance(file_name, bytes):
+                            file_name = file_name.decode('utf-8')
+                        dest_key = f"{self.destination_prefix}/{file_name}"
 
-                    batch.append((s3_key, buffer, file_size))
+                        current_batch.append((dest_key, unzipped_chunks, file_size))
 
-                    if len(batch) >= self.batch_size:
-                        self.upload_batch(s3_client, batch)
-                        batch = []
+                        if len(current_batch) >= self.batch_size:
+                            batch_queue.put(current_batch)
+                            current_batch = []
 
-                    if self.total_files % 1000 == 0:
-                        self.log_progress(job_id, start_time)
-                except Exception as e:
-                    logger.error(f"Error processing file {file_name}: {str(e)}")
-                    self.error_files.append({"file": file_name, "error": str(e)})
+                        if self.total_files % 10000 == 0:
+                            self.log_progress(job_id, start_time)
+                    except Exception as e:
+                        logger.error(f"Error processing file {file_name}: {str(e)}")
+                        self.error_files.append({"file": file_name, "error": str(e)})
 
-            if batch:
-                self.upload_batch(s3_client, batch)
+                if current_batch:
+                    batch_queue.put(current_batch)
+
+                for _ in range(self.concurrent_batches):
+                    batch_queue.put(None)
+
+                for future in as_completed(futures):
+                    future.result()
 
         except Exception as e:
             logger.error(f"Error processing zip file {s3_key}: {str(e)}")
             self.error_files.append({"file": s3_key, "error": str(e)})
 
+    def process_batches(self, s3_client, batch_queue, job_id, start_time):
+        while True:
+            batch = batch_queue.get()
+            if batch is None:
+                break
+            self.upload_batch(s3_client, batch)
+            batch_queue.task_done()
+            self.log_progress(job_id, start_time)
+
     def upload_batch(self, s3_client, batch):
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
             futures = []
-            for s3_key, file_content, file_size in batch:
-                try:
-                    file_size = int(file_size) if file_size is not None else None
-                except ValueError:
-                    logger.warning(f"Invalid file size for {s3_key}: {file_size}. Setting to None.")
-                    file_size = None
-
+            for dest_key, unzipped_chunks, file_size in batch:
                 futures.append(executor.submit(
-                    multipart_upload_to_s3,
-                    s3_client, file_content, self.s3_bucket, s3_key, file_size
+                    self.upload_file,
+                    s3_client, dest_key, unzipped_chunks, file_size
                 ))
 
             for future in as_completed(futures):
@@ -186,17 +177,24 @@ class UnzipOperator(BaseOperator):
                     logger.error(f"Error uploading file: {str(e)}")
                     self.error_files.append({"file": "unknown", "error": str(e)})
 
+    def upload_file(self, s3_client, dest_key, unzipped_chunks, file_size):
+        try:
+            multipart_upload_to_s3(s3_client, unzipped_chunks, self.s3_bucket, dest_key, file_size)
+        except Exception as e:
+            logger.error(f"Error uploading file {dest_key}: {str(e)}")
+            raise
+
     def log_progress(self, job_id, start_time, force=False):
         current_time = time.time()
         elapsed_time = Decimal(str(current_time - start_time))
         files_per_second = Decimal(str(self.processed_files)) / elapsed_time if elapsed_time > 0 else Decimal('0')
         progress = (Decimal(str(self.processed_files)) / Decimal(str(self.total_files))) * Decimal('100') if self.total_files > 0 else Decimal('0')
 
-        logger.info(f"Progress: {progress:.2f}% ({self.processed_files}/{self.total_files} files)")
-        logger.info(f"Processing speed: {files_per_second:.2f} files/second")
-        logger.info(f"Elapsed time: {elapsed_time:.2f} seconds")
+        if force or int(progress) in [0, 5, 10, 20, 40, 60, 80, 100]:
+            logger.info(f"Progress: {progress:.2f}% ({self.processed_files}/{self.total_files} files)")
+            logger.info(f"Processing speed: {files_per_second:.2f} files/second")
+            logger.info(f"Elapsed time: {elapsed_time:.2f} seconds")
 
-        if force or int(progress) in [0, 5, 10, 25, 50, 75, 100]:
             update_job_state(job_id, status='in_progress', progress=int(progress),
                              metadata={'processed_files': self.processed_files, 'total_files': self.total_files,
                                        'files_per_second': str(files_per_second), 'elapsed_time': str(elapsed_time)})

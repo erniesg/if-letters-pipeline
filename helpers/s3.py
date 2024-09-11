@@ -7,6 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import boto3.s3.transfer
 from botocore.config import Config
+import queue
+import threading
+from stream_unzip import stream_unzip
 
 logger = logging.getLogger(__name__)
 
@@ -15,19 +18,18 @@ config = get_config()
 s3_config = config['s3']
 processing_config = config.get('processing', {})
 
-# Update the transfer_config to use the new settings
 def get_transfer_config(max_concurrency=None, multipart_threshold=None, multipart_chunksize=None):
     return boto3.s3.transfer.TransferConfig(
-        multipart_threshold=multipart_threshold or processing_config.get('multipart_threshold', 16 * 1024 * 1024),
-        max_concurrency=max_concurrency or processing_config.get('max_concurrency', 64),
-        multipart_chunksize=multipart_chunksize or processing_config.get('multipart_chunksize', 16 * 1024 * 1024),
+        multipart_threshold=multipart_threshold or processing_config.get('multipart_threshold', 8 * 1024 * 1024),
+        max_concurrency=max_concurrency or processing_config.get('max_concurrency', 100),
+        multipart_chunksize=multipart_chunksize or processing_config.get('multipart_chunksize', 8 * 1024 * 1024),
         use_threads=True
     )
 
 def get_optimized_s3_client():
     config = Config(
-        retries={'max_attempts': 5, 'mode': 'adaptive'},
-        max_pool_connections=processing_config.get('max_pool_connections', 200)
+        retries={'max_attempts': 10, 'mode': 'adaptive'},
+        max_pool_connections=processing_config.get('max_pool_connections', 500)
     )
     return boto3.client('s3', config=config)
 
@@ -44,37 +46,6 @@ def upload_to_s3(content, bucket, s3_key):
         raise
 
 @ensure_resource('s3')
-def batch_upload_to_s3(file_list, bucket, max_workers=None, multipart_threshold=None, multipart_chunksize=None):
-    if max_workers is None:
-        max_workers = processing_config.get('max_concurrency', 64)
-
-    s3_client = get_optimized_s3_client()
-    transfer_config = get_transfer_config(max_workers, multipart_threshold, multipart_chunksize)
-
-    def upload_file(file_info):
-        content, s3_key = file_info
-        try:
-            s3_client.upload_fileobj(BytesIO(content), bucket, s3_key, Config=transfer_config)
-            logger.info(f"Successfully uploaded to s3://{bucket}/{s3_key}")
-            return s3_key, True
-        except ClientError as e:
-            logger.error(f"Error uploading to s3://{bucket}/{s3_key}: {str(e)}")
-            return s3_key, False
-
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_key = {executor.submit(upload_file, file_info): file_info[1] for file_info in file_list}
-        for future in as_completed(future_to_key):
-            s3_key = future_to_key[future]
-            try:
-                results.append(future.result())
-            except Exception as e:
-                logger.error(f"Unexpected error uploading {s3_key}: {str(e)}")
-                results.append((s3_key, False))
-
-    return results
-
-@ensure_resource('s3')
 @handle_existing_item
 def download_from_s3(bucket, s3_key):
     try:
@@ -85,6 +56,112 @@ def download_from_s3(bucket, s3_key):
     except ClientError as e:
         logger.error(f"Error downloading from s3://{bucket}/{s3_key}: {str(e)}")
         return None
+
+@ensure_resource('s3')
+@handle_existing_item
+def stream_download_from_s3(s3_client, bucket, key, chunk_size=None):
+    if chunk_size is None:
+        chunk_size = processing_config.get('chunk_size', 67108864)  # Default to 64MB if not specified
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        for chunk in response['Body'].iter_chunks(chunk_size=chunk_size):
+            yield chunk
+    except ClientError as e:
+        logger.error(f"Error streaming from s3://{bucket}/{key}: {str(e)}")
+        raise
+
+def bulk_upload_to_s3(s3_client, file_batches, bucket, max_workers=None):
+    if max_workers is None:
+        max_workers = processing_config.get('max_concurrency', 64)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {executor.submit(upload_batch, s3_client, batch, bucket): i for i, batch in enumerate(file_batches)}
+        for future in as_completed(future_to_batch):
+            batch_index = future_to_batch[future]
+            try:
+                results.extend(future.result())
+            except Exception as e:
+                logger.error(f"Error uploading batch {batch_index}: {str(e)}")
+                results.extend([(f"batch_{batch_index}", False)])
+
+    return results
+
+def upload_batch(s3_client, batch, bucket):
+    results = []
+    for file_name, file_content in batch:
+        try:
+            s3_client.put_object(Body=file_content, Bucket=bucket, Key=file_name)
+            results.append((file_name, True))
+        except ClientError as e:
+            logger.error(f"Error uploading file {file_name} to s3://{bucket}: {str(e)}")
+            results.append((file_name, False))
+    return results
+
+def stream_unzip_and_upload(s3_client, source_bucket, source_key, dest_bucket, dest_prefix,
+                            batch_size=1000, max_workers=64, concurrent_batches=8, unzip_password=None):
+    batch_queue = queue.Queue(maxsize=concurrent_batches * 2)
+    upload_queue = queue.Queue(maxsize=concurrent_batches * 2)
+
+    def process_batches():
+        while True:
+            batch = batch_queue.get()
+            if batch is None:
+                break
+            upload_queue.put(batch)
+            batch_queue.task_done()
+
+    def upload_batches():
+        while True:
+            batch = upload_queue.get()
+            if batch is None:
+                break
+            bulk_upload_to_s3(s3_client, [batch], dest_bucket, max_workers)
+            upload_queue.task_done()
+
+    # Start batch processing thread
+    batch_thread = threading.Thread(target=process_batches)
+    batch_thread.start()
+
+    # Start upload threads
+    upload_threads = []
+    for _ in range(concurrent_batches):
+        t = threading.Thread(target=upload_batches)
+        t.start()
+        upload_threads.append(t)
+
+    current_batch = []
+    total_files = 0
+
+    for chunk in stream_download_from_s3(s3_client, source_bucket, source_key):
+        for file_name, file_size, unzipped_chunks in stream_unzip(chunk, password=unzip_password):
+            if isinstance(file_name, bytes):
+                file_name = file_name.decode('utf-8')
+            dest_key = f"{dest_prefix}/{file_name}"
+
+            current_batch.append((dest_key, b''.join(unzipped_chunks)))
+            total_files += 1
+
+            if len(current_batch) >= batch_size:
+                batch_queue.put(current_batch)
+                current_batch = []
+
+    if current_batch:
+        batch_queue.put(current_batch)
+
+    # Signal the end of processing
+    batch_queue.put(None)
+    batch_thread.join()
+
+    # Signal the end of batches
+    for _ in range(concurrent_batches):
+        upload_queue.put(None)
+
+    # Wait for all upload threads to complete
+    for t in upload_threads:
+        t.join()
+
+    return total_files
 
 @ensure_resource('s3')
 @handle_existing_item
@@ -154,7 +231,6 @@ def copy_s3_object(source_bucket, source_key, dest_bucket, dest_key):
         logger.error(f"Error copying s3://{source_bucket}/{source_key} to s3://{dest_bucket}/{dest_key}: {str(e)}")
         raise
 
-# Add this new function at the beginning of the file, after the imports and config setup
 def get_s3_path(dataset_name, file_type='data', file_index=None):
     if file_type == 'data':
         base_path = f"{s3_config['data_prefix']}/{dataset_name}"
@@ -163,29 +239,6 @@ def get_s3_path(dataset_name, file_type='data', file_index=None):
         return f"{s3_config['processed_folder']}/{dataset_name}"
     else:
         raise ValueError(f"Invalid file_type: {file_type}")
-
-# Update the stream_download_from_s3 function
-@ensure_resource('s3')
-@handle_existing_item
-def stream_download_from_s3(s3_client, bucket, key, chunk_size=None):
-    if chunk_size is None:
-        chunk_size = processing_config.get('chunk_size', 128 * 1024 * 1024)
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    for chunk in response['Body'].iter_chunks(chunk_size=chunk_size):
-        yield chunk
-
-def multipart_upload_to_s3(s3_client, file_content, bucket, s3_key, file_size=None):
-    transfer_config = get_transfer_config()
-    try:
-        if isinstance(file_content, BytesIO):
-            s3_client.upload_fileobj(file_content, bucket, s3_key, Config=transfer_config)
-        else:
-            s3_client.upload_fileobj(BytesIO(file_content), bucket, s3_key, Config=transfer_config)
-        logger.info(f"Successfully uploaded to s3://{bucket}/{s3_key}")
-        return True
-    except ClientError as e:
-        logger.error(f"Error uploading to s3://{bucket}/{s3_key}: {str(e)}")
-        return False
 
 @ensure_resource('s3')
 def get_s3_object_size(bucket, s3_key):
@@ -197,7 +250,7 @@ def get_s3_object_size(bucket, s3_key):
         logger.error(f"Error getting size for s3://{bucket}/{s3_key}: {str(e)}")
         return None
 
-__all__ = ['upload_to_s3', 'batch_upload_to_s3', 'download_from_s3', 'check_s3_object_exists',
-           'get_s3_object_info', 'check_s3_prefix_exists', 'list_s3_objects',
-           'copy_s3_object', 'stream_download_from_s3', 'multipart_upload_to_s3', 'get_s3_path',
+__all__ = ['upload_to_s3', 'download_from_s3', 'stream_download_from_s3', 'bulk_upload_to_s3',
+           'stream_unzip_and_upload', 'check_s3_object_exists', 'get_s3_object_info',
+           'check_s3_prefix_exists', 'list_s3_objects', 'copy_s3_object', 'get_s3_path',
            'get_s3_object_size']
