@@ -174,16 +174,30 @@ def stream_download_from_s3(s3_client, bucket, key, chunk_size=None):
     for chunk in response['Body'].iter_chunks(chunk_size=chunk_size):
         yield chunk
 
-def multipart_upload_to_s3(s3_client, file_content, bucket, s3_key):
+def multipart_upload_to_s3(s3_client, file_content, bucket, s3_key, file_size=None):
     transfer_config = get_transfer_config()
     try:
-        s3_client.upload_fileobj(BytesIO(file_content), bucket, s3_key, Config=transfer_config)
+        if isinstance(file_content, BytesIO):
+            s3_client.upload_fileobj(file_content, bucket, s3_key, Config=transfer_config)
+        else:
+            s3_client.upload_fileobj(BytesIO(file_content), bucket, s3_key, Config=transfer_config)
         logger.info(f"Successfully uploaded to s3://{bucket}/{s3_key}")
         return True
     except ClientError as e:
         logger.error(f"Error uploading to s3://{bucket}/{s3_key}: {str(e)}")
         return False
 
+@ensure_resource('s3')
+def get_s3_object_size(bucket, s3_key):
+    try:
+        s3_client = get_optimized_s3_client()
+        response = s3_client.head_object(Bucket=bucket, Key=s3_key)
+        return response['ContentLength']
+    except ClientError as e:
+        logger.error(f"Error getting size for s3://{bucket}/{s3_key}: {str(e)}")
+        return None
+
 __all__ = ['upload_to_s3', 'batch_upload_to_s3', 'download_from_s3', 'check_s3_object_exists',
            'get_s3_object_info', 'check_s3_prefix_exists', 'list_s3_objects',
-           'copy_s3_object', 'stream_download_from_s3', 'multipart_upload_to_s3', 'get_s3_path']
+           'copy_s3_object', 'stream_download_from_s3', 'multipart_upload_to_s3', 'get_s3_path',
+           'get_s3_object_size']

@@ -1,5 +1,5 @@
 import boto3
-from stream_unzip import stream_unzip
+from stream_unzip import stream_unzip, NO_ENCRYPTION, ZIP_CRYPTO, AE_1, AE_2, AES_128, AES_192, AES_256
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
@@ -20,12 +20,24 @@ class StreamingZipProcessor:
         self.source_key = source_key
         self.dest_bucket = dest_bucket
         self.dest_prefix = dest_prefix
-        self.unzip_password = unzip_password
+        self.unzip_password = unzip_password.encode('utf-8') if unzip_password else None
 
     def process(self):
         logger.debug(f"Processing zip file: s3://{self.source_bucket}/{self.source_key}")
         try:
-            for file_name, file_size, unzipped_chunks in stream_unzip(self.zipped_chunks(), password=self.unzip_password):
+            for file_name, file_size, unzipped_chunks in stream_unzip(
+                self.zipped_chunks(),
+                password=self.unzip_password,
+                allowed_encryption_mechanisms=(
+                    NO_ENCRYPTION,
+                    ZIP_CRYPTO,
+                    AE_1,
+                    AE_2,
+                    AES_128,
+                    AES_192,
+                    AES_256,
+                )
+            ):
                 yield file_name, file_size, unzipped_chunks
         except Exception as e:
             logger.error(f"Error in StreamingZipProcessor.process(): {str(e)}")
@@ -122,39 +134,52 @@ class UnzipOperator(BaseOperator):
 
             batch = []
             for file_name, file_size, unzipped_chunks in processor.process():
-                self.total_files += 1
-                if isinstance(file_name, bytes):
-                    file_name = file_name.decode('utf-8')
-                s3_key = f"{self.destination_prefix}/{file_name}"
+                try:
+                    self.total_files += 1
+                    if isinstance(file_name, bytes):
+                        file_name = file_name.decode('utf-8')
+                    s3_key = f"{self.destination_prefix}/{file_name}"
 
-                buffer = BytesIO()
-                for chunk in unzipped_chunks:
-                    buffer.write(chunk)
-                buffer.seek(0)
+                    buffer = BytesIO()
+                    for chunk in unzipped_chunks:
+                        buffer.write(chunk)
+                    buffer.seek(0)
 
-                batch.append((s3_key, buffer))
+                    file_size = int(file_size) if file_size is not None else None
 
-                if len(batch) >= self.batch_size:
-                    self.upload_batch(s3_client, batch)
-                    batch = []
+                    batch.append((s3_key, buffer, file_size))
 
-                if self.total_files % 1000 == 0:
-                    self.log_progress(job_id, start_time)
+                    if len(batch) >= self.batch_size:
+                        self.upload_batch(s3_client, batch)
+                        batch = []
+
+                    if self.total_files % 1000 == 0:
+                        self.log_progress(job_id, start_time)
+                except Exception as e:
+                    logger.error(f"Error processing file {file_name}: {str(e)}")
+                    self.error_files.append({"file": file_name, "error": str(e)})
 
             if batch:
                 self.upload_batch(s3_client, batch)
 
         except Exception as e:
-            logger.error(f"Error processing file {s3_key}: {str(e)}")
-            self.error_files.append({"file": s3_key, "error": str(e)})
+            logger.error(f"Error processing zip file {s3_key}: {str(e)}")
+            self.error_files.append({"file": s3_key, "error": str(e)}")
 
     def upload_batch(self, s3_client, batch):
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
             futures = []
-            for s3_key, file_content in batch:
+            for s3_key, file_content, file_size in batch:
+                # If file_size is None or not a valid integer, pass None
+                try:
+                    file_size = int(file_size) if file_size is not None else None
+                except ValueError:
+                    logger.warning(f"Invalid file size for {s3_key}: {file_size}. Setting to None.")
+                    file_size = None
+
                 futures.append(executor.submit(
                     multipart_upload_to_s3,
-                    s3_client, file_content, self.s3_bucket, s3_key
+                    s3_client, file_content, self.s3_bucket, s3_key, file_size
                 ))
 
             for future in as_completed(futures):
