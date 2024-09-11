@@ -50,10 +50,21 @@ class StreamingZipProcessor:
             yield chunk
 
 class UnzipOperator(BaseOperator):
-    def __init__(self, dataset_name, s3_key, max_concurrency=32, buffer_size=8*1024*1024, buffer_pool_size=64, **kwargs):
+    def __init__(
+        self,
+        dataset_name,
+        s3_keys,
+        max_concurrency=32,
+        buffer_size=8*1024*1024,
+        buffer_pool_size=64,
+        max_pool_connections=None,
+        batch_size=None,
+        chunk_size=None,
+        **kwargs
+    ):
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
-        self.s3_key = s3_key
+        self.s3_keys = s3_keys if isinstance(s3_keys, list) else [s3_keys]
         self.config = get_config()
         self.s3_config = self.config['s3']
         self.s3_bucket = self.s3_config['bucket_name']
@@ -62,6 +73,9 @@ class UnzipOperator(BaseOperator):
         self.max_concurrency = max_concurrency
         self.buffer_size = buffer_size
         self.buffer_pool_size = buffer_pool_size
+        self.max_pool_connections = max_pool_connections
+        self.batch_size = batch_size
+        self.chunk_size = chunk_size
         self.error_files = []
         self.checkpoint_interval = 5000
         self.processed_files = 0
@@ -109,7 +123,7 @@ class UnzipOperator(BaseOperator):
                 return
 
             update_job_state(job_id, status='in_progress', progress=0)
-            logger.info(f"Starting streaming unzip operation for {self.s3_key}")
+            logger.info(f"Starting streaming unzip operation for {len(self.s3_keys)} files")
 
             # Try to load checkpoint
             checkpoint = self.load_checkpoint(job_id)
@@ -118,43 +132,10 @@ class UnzipOperator(BaseOperator):
                 self.total_files = checkpoint['total_files']
                 logger.info(f"Resuming from checkpoint. Processed files: {self.processed_files}")
 
-            processor = StreamingZipProcessor(
-                s3_client, self.s3_bucket, self.s3_key,
-                self.s3_bucket, self.destination_prefix, buffer_pool, self.unzip_password
-            )
-
             start_time = time.time()
 
-            with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
-                future_to_file = {}
-                for file_name, file_content in processor.process():
-                    self.total_files += 1
-                    s3_key = f"{self.destination_prefix}/{file_name}"
-                    future = executor.submit(
-                        multipart_upload_to_s3,
-                        s3_client, file_content, self.s3_bucket, s3_key
-                    )
-                    future_to_file[future] = file_name
-
-                    if self.total_files % 1000 == 0:
-                        self.log_progress(job_id, start_time)
-
-                for future in as_completed(future_to_file):
-                    file_name = future_to_file[future]
-                    try:
-                        future.result()
-                        self.processed_files += 1
-                    except Exception as e:
-                        logger.error(f"Error uploading file {file_name}: {str(e)}")
-                        self.error_files.append({"file": file_name, "error": str(e)})
-
-                    buffer_pool.put(future.result())
-
-                    if self.processed_files % self.checkpoint_interval == 0:
-                        self.save_checkpoint(job_id, {'processed_files': self.processed_files, 'total_files': self.total_files})
-
-                    if self.processed_files % 1000 == 0:
-                        self.log_progress(job_id, start_time)
+            for s3_key in self.s3_keys:
+                self.process_single_file(s3_client, s3_key, buffer_pool, job_id, start_time)
 
             self.log_progress(job_id, start_time, force=True)
 
@@ -183,6 +164,44 @@ class UnzipOperator(BaseOperator):
             logger.error(f"Unzip operation failed: {str(e)}")
             update_job_state(job_id, status='failed', progress=0, metadata={'error': str(e)})
             raise
+
+    def process_single_file(self, s3_client, s3_key, buffer_pool, job_id, start_time):
+        logger.info(f"Processing file: {s3_key}")
+        processor = StreamingZipProcessor(
+            s3_client, self.s3_bucket, s3_key,
+            self.s3_bucket, self.destination_prefix, buffer_pool, self.unzip_password
+        )
+
+        with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
+            future_to_file = {}
+            for file_name, file_content in processor.process():
+                self.total_files += 1
+                s3_key = f"{self.destination_prefix}/{file_name}"
+                future = executor.submit(
+                    multipart_upload_to_s3,
+                    s3_client, file_content, self.s3_bucket, s3_key
+                )
+                future_to_file[future] = file_name
+
+                if self.total_files % 1000 == 0:
+                    self.log_progress(job_id, start_time)
+
+            for future in as_completed(future_to_file):
+                file_name = future_to_file[future]
+                try:
+                    future.result()
+                    self.processed_files += 1
+                except Exception as e:
+                    logger.error(f"Error uploading file {file_name}: {str(e)}")
+                    self.error_files.append({"file": file_name, "error": str(e)})
+
+                buffer_pool.put(future.result())
+
+                if self.processed_files % self.checkpoint_interval == 0:
+                    self.save_checkpoint(job_id, {'processed_files': self.processed_files, 'total_files': self.total_files})
+
+                if self.processed_files % 1000 == 0:
+                    self.log_progress(job_id, start_time)
 
     def log_progress(self, job_id, start_time, force=False):
         current_time = time.time()

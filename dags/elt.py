@@ -83,9 +83,9 @@ def create_dataset_dag(dataset_name, default_args):
 
             # Get configuration values, with fallbacks to processing_config and then to default values
             max_pool_connections = dataset_config.get('max_pool_connections',
-                                                      processing_config.get('max_pool_connections', 200))
+                                                    processing_config.get('max_pool_connections', 200))
             max_concurrency = dataset_config.get('max_concurrency',
-                                                 processing_config.get('max_concurrency', 64))
+                                                processing_config.get('max_concurrency', 64))
             batch_size = dataset_config.get('batch_size',
                                             processing_config.get('batch_size', 1000))
             chunk_size = dataset_config.get('chunk_size',
@@ -99,8 +99,8 @@ def create_dataset_dag(dataset_name, default_args):
                         task_id=f'unzip_{dataset_name}_{i}',
                         dataset_name=dataset_name,
                         s3_key=s3_key,
-                        max_pool_connections=max_pool_connections,
                         max_concurrency=max_concurrency,
+                        max_pool_connections=max_pool_connections,
                         batch_size=batch_size,
                         chunk_size=chunk_size
                     )
@@ -112,8 +112,8 @@ def create_dataset_dag(dataset_name, default_args):
                     task_id=f'unzip_{dataset_name}',
                     dataset_name=dataset_name,
                     s3_key=s3_key,
-                    max_pool_connections=max_pool_connections,
                     max_concurrency=max_concurrency,
+                    max_pool_connections=max_pool_connections,
                     batch_size=batch_size,
                     chunk_size=chunk_size
                 )
