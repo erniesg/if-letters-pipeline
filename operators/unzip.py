@@ -11,6 +11,7 @@ from helpers.config import get_config
 import logging
 import time
 from decimal import Decimal
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class StreamingZipProcessor:
                 yield file_name, file_size, unzipped_chunks
         except Exception as e:
             logger.error(f"Error in StreamingZipProcessor.process(): {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
 
     def zipped_chunks(self):
