@@ -45,6 +45,7 @@ processing:
   multipart_chunksize: 33554432  # 8MB
   buffer_size: 16777216  # 8MB (8 * 1024 * 1024)
   buffer_pool_size: 128
+  small_file_threshold: 314572800  # 300MB
 
 dynamodb:
   table_name: ETLJobTracker

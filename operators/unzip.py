@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Thread
 from airflow.models import BaseOperator
-from helpers.s3 import multipart_upload_to_s3, get_optimized_s3_client, stream_download_from_s3
+from helpers.s3 import bulk_upload_to_s3, get_optimized_s3_client, stream_download_from_s3
 from helpers.dynamodb import update_job_state
 from helpers.config import get_config
 import logging
@@ -179,7 +179,10 @@ class UnzipOperator(BaseOperator):
 
     def upload_file(self, s3_client, dest_key, unzipped_chunks, file_size):
         try:
-            multipart_upload_to_s3(s3_client, unzipped_chunks, self.s3_bucket, dest_key, file_size)
+            if file_size < 314572800:  # 300MB
+                bulk_upload_to_s3(s3_client, [(dest_key, b''.join(unzipped_chunks))], self.s3_bucket)
+            else:
+                s3_client.upload_fileobj(BytesIO(b''.join(unzipped_chunks)), self.s3_bucket, dest_key)
         except Exception as e:
             logger.error(f"Error uploading file {dest_key}: {str(e)}")
             raise
